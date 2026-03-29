@@ -1,0 +1,47 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual Environment ────────────────────────────────
+.venv/
+venv/
+env/
+get-pip.py
+
+# ── Secrets / Environment ──────────────────────────────
+.env
+*.pem
+*.key
+
+# ── Model & Data Cache ─────────────────────────────────
+.cache/
+data/chroma_baseline/
+
+# ── Generated Outputs (reproduce via scripts) ──────────
+runs/
+logs/
+reports/
+
+# ── Testing / IDE / OS ─────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+PROJECT_README.md

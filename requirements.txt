@@ -1,0 +1,29 @@
+# unified-ai-security
+# Python 3.10+
+#
+# Install:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install torch                # GPU (CUDA)
+#   pip install -r requirements.txt
+#
+# CPU-only (faster install, no CUDA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+
+# Core ML
+sentence-transformers>=2.2.0
+numpy>=1.24,<3
+
+# RAG vector store
+chromadb>=0.4.22,<2
+
+# Schemas & validation
+pydantic>=2.0
+
+# Env / config
+python-dotenv>=1.0
+
+# API gateway
+fastapi>=0.100
+uvicorn[standard]>=0.22
+requests>=2.28

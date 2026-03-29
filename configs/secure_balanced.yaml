@@ -1,0 +1,27 @@
+# Example config preset
+llm:
+  provider: ollama
+  model: qwen2.5:7b
+
+vector_db:
+  type: chromadb
+
+policy:
+  fusion:
+    type: weighted_sum
+    weights:
+      output_agency: 0.40
+      prompt_guard: 0.30
+      rag_guard: 0.30
+    thresholds:
+      allow: 0.30
+      sanitize: 0.60
+      block: 0.85
+
+modules:
+  output_agency:
+    enabled: true
+  prompt_guard:
+    enabled: true
+  rag_guard:
+    enabled: true
