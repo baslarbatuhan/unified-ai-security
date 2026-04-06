@@ -14,8 +14,10 @@ Pipeline:
 Validates that poisoned documents are detected within the retrieval pipeline.
 
 Usage:
-    python tests/test_rag_poison_detection.py
-    python tests/test_rag_poison_detection.py --model BAAI/bge-large-en-v1.5
+    python3 tests/test_rag_poison_detection.py
+    python3 tests/test_rag_poison_detection.py --mode embedding
+    python3 tests/test_rag_poison_detection.py --mode hybrid --skip-judge
+    python3 tests/test_rag_poison_detection.py --model BAAI/bge-large-en-v1.5
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -40,11 +42,58 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 try:
     from rag_guard.poison_detector import PoisonDetector
-    from rag_guard.risk_scoring import RAGRiskScorer, RiskThresholds
+    from rag_guard.risk_scoring import RAGRiskScorer
 except ImportError:
     sys.path.insert(0, str(_PROJECT_ROOT / "rag_guard"))
     from poison_detector import PoisonDetector
-    from risk_scoring import RAGRiskScorer, RiskThresholds
+    from risk_scoring import RAGRiskScorer
+
+
+def _run_embedding_path(
+    simulated_retrieval: List[Dict[str, Any]],
+    detector: PoisonDetector,
+    scorer: RAGRiskScorer,
+) -> Tuple[Any, Any, int, str, int, int, float]:
+    t0 = time.time()
+    detection = detector.detect(simulated_retrieval)
+    risk = scorer.score(detection)
+    latency = int((time.time() - t0) * 1000)
+    return (
+        detection,
+        risk,
+        latency,
+        risk.decision,
+        detection.suspicious_count,
+        detection.total_documents,
+        detection.suspicion_ratio,
+    )
+
+
+def _run_hybrid_path(
+    simulated_retrieval: List[Dict[str, Any]],
+    query: str,
+    use_judge: bool,
+) -> Tuple[Any, Any, int, str, int, int, float]:
+    from fusion_gateway.engine import _get_rag_pipeline
+
+    t0 = time.time()
+    pipeline = _get_rag_pipeline()
+    result = pipeline.run(simulated_retrieval, user_query=query or "", use_judge=use_judge)
+    latency = int((time.time() - t0) * 1000)
+    rr = result.risk_result
+    suspicious = sum(1 for ds in result.doc_scores if ds.is_suspicious)
+    ratio = suspicious / len(result.doc_scores) if result.doc_scores else 0.0
+    decision = rr.decision if rr else "allow"
+    risk_score = rr.risk_score if rr else 0.0
+    return (
+        result,
+        type("R", (), {"risk_score": risk_score, "decision": decision})(),
+        latency,
+        decision,
+        suspicious,
+        len(simulated_retrieval),
+        ratio,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +102,8 @@ except ImportError:
 def run_rag_poison_tests(
     dataset_path: Path = _DATASET_PATH,
     embedding_model: str = "BAAI/bge-m3",
+    pipeline_mode: str = "hybrid",
+    use_llm_judge: bool = True,
 ) -> Dict:
     """
     Run full RAG poison detection test pipeline.
@@ -79,9 +130,11 @@ def run_rag_poison_tests(
     # Initialize detector and scorer
     detector = PoisonDetector(embedding_model=embedding_model)
     scorer = RAGRiskScorer()
+    mode = (pipeline_mode or "hybrid").lower()
 
     print(f"\n{'='*65}")
     print(f"  RAG POISON DETECTION TEST SUITE")
+    print(f"  Mode: {mode}" + (f" (LLM judge={'on' if use_llm_judge else 'off'})" if mode == "hybrid" else ""))
     print(f"  Model: {embedding_model}")
     print(f"  Documents: {len(clean_docs)} clean + {len(poisoned_docs)} poisoned")
     print(f"{'='*65}")
@@ -107,20 +160,22 @@ def run_rag_poison_tests(
             for d in clean_docs[:4]
         ]
 
-        t0 = time.time()
+        if mode == "embedding":
+            detection, risk, latency, decision, pcount, tret, pratio = _run_embedding_path(
+                simulated_retrieval, detector, scorer
+            )
+            poisoned_doc_score = detection.document_scores[0]
+            detected = poisoned_doc_score.is_suspicious
+            score_show = poisoned_doc_score.poison_score
+        else:
+            result, risk, latency, decision, pcount, tret, pratio = _run_hybrid_path(
+                simulated_retrieval, target_query, use_llm_judge
+            )
+            ds0 = result.doc_scores[0] if result.doc_scores else None
+            detected = bool(ds0 and ds0.is_suspicious)
+            score_show = ds0.combined_score if ds0 else 0.0
 
-        # Step 3: Run poison detector
-        detection = detector.detect(simulated_retrieval)
-
-        # Step 4: Compute risk score
-        risk = scorer.score(detection)
-
-        latency = int((time.time() - t0) * 1000)
         total_latency += latency
-
-        # Step 5: Check if poisoned doc was detected
-        poisoned_doc_score = detection.document_scores[0]  # first doc is the poisoned one
-        detected = poisoned_doc_score.is_suspicious
 
         if detected:
             tp += 1
@@ -128,24 +183,25 @@ def run_rag_poison_tests(
             fn += 1
 
         status = "TP" if detected else "FN"
-        print(f"    [{status}] {pdoc['doc_id']:12s} | score={poisoned_doc_score.poison_score:.3f} | "
-              f"risk={risk.risk_score:.3f} | decision={risk.decision} | "
+        print(f"    [{status}] {pdoc['doc_id']:12s} | score={score_show:.3f} | "
+              f"risk={risk.risk_score:.3f} | decision={decision} | "
               f"type={pdoc['poison_type']}")
 
         results.append({
             "module": "rag_guard",
             "test_case": target_query[:80],
-            "decision": risk.decision,
+            "decision": decision,
             "risk_score": round(risk.risk_score, 4),
             "latency": latency,
             "query": target_query[:80],
-            "poisoned_count": detection.suspicious_count,
-            "total_retrieved": detection.total_documents,
-            "poison_ratio": round(detection.suspicion_ratio, 4),
+            "poisoned_count": pcount,
+            "total_retrieved": tret,
+            "poison_ratio": round(pratio, 4),
             "actual_label": 1,
             "predicted_label": 1 if detected else 0,
             "poison_type": pdoc["poison_type"],
             "doc_id": pdoc["doc_id"],
+            "pipeline_mode": mode,
         })
 
     # ---- TEST SET 2: Clean-only retrieval (no poisoned docs) ----
@@ -171,13 +227,19 @@ def run_rag_poison_tests(
             for d in clean_docs[:5]
         ]
 
-        t0 = time.time()
-        detection = detector.detect(simulated_retrieval)
-        risk = scorer.score(detection)
-        latency = int((time.time() - t0) * 1000)
+        if mode == "embedding":
+            detection, risk, latency, decision, pcount, tret, pratio = _run_embedding_path(
+                simulated_retrieval, detector, scorer
+            )
+            false_alarm = detection.suspicious_count > 0
+        else:
+            result, risk, latency, decision, pcount, tret, pratio = _run_hybrid_path(
+                simulated_retrieval, query, use_llm_judge
+            )
+            false_alarm = any(ds.is_suspicious for ds in result.doc_scores)
+
         total_latency += latency
 
-        false_alarm = detection.suspicious_count > 0
         if false_alarm:
             fp += 1
             status = "FP"
@@ -185,24 +247,25 @@ def run_rag_poison_tests(
             tn += 1
             status = "TN"
 
-        print(f"    [{status}] suspicious={detection.suspicious_count} | "
-              f"risk={risk.risk_score:.3f} | decision={risk.decision} | "
+        print(f"    [{status}] suspicious={pcount} | "
+              f"risk={risk.risk_score:.3f} | decision={decision} | "
               f"\"{query[:50]}\"")
 
         results.append({
             "module": "rag_guard",
             "test_case": query[:80],
-            "decision": risk.decision,
+            "decision": decision,
             "risk_score": round(risk.risk_score, 4),
             "latency": latency,
             "query": query[:80],
-            "poisoned_count": detection.suspicious_count,
-            "total_retrieved": detection.total_documents,
-            "poison_ratio": round(detection.suspicion_ratio, 4),
+            "poisoned_count": pcount,
+            "total_retrieved": tret,
+            "poison_ratio": round(pratio, 4),
             "actual_label": 0,
             "predicted_label": 1 if false_alarm else 0,
             "poison_type": "none",
             "doc_id": "clean_set",
+            "pipeline_mode": mode,
         })
 
     # ---- METRICS ----
@@ -239,7 +302,7 @@ def run_rag_poison_tests(
     fieldnames = [
         "module", "test_case", "decision", "risk_score", "latency",
         "query", "poisoned_count", "total_retrieved", "poison_ratio",
-        "actual_label", "predicted_label", "poison_type", "doc_id",
+        "actual_label", "predicted_label", "poison_type", "doc_id", "pipeline_mode",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -250,6 +313,8 @@ def run_rag_poison_tests(
 
     return {
         "model": embedding_model,
+        "pipeline_mode": mode,
+        "use_llm_judge": use_llm_judge if mode == "hybrid" else None,
         "tp": tp, "fp": fp, "tn": tn, "fn": fn,
         "precision": round(precision, 4),
         "recall": round(recall, 4),
@@ -268,11 +333,24 @@ def main():
     parser = argparse.ArgumentParser(description="RAG Poison Detection Tests")
     parser.add_argument("--dataset", type=str, default=str(_DATASET_PATH))
     parser.add_argument("--model", type=str, default="BAAI/bge-m3")
+    parser.add_argument(
+        "--mode",
+        choices=("hybrid", "embedding"),
+        default="hybrid",
+        help="hybrid: RAGGuardPipeline (same config as fusion); embedding: detector+RAGRiskScorer only",
+    )
+    parser.add_argument(
+        "--skip-judge",
+        action="store_true",
+        help="In hybrid mode, skip Ollama LLM judge (embedding + filter + risk only)",
+    )
     args = parser.parse_args()
 
     metrics = run_rag_poison_tests(
         dataset_path=Path(args.dataset),
         embedding_model=args.model,
+        pipeline_mode=args.mode,
+        use_llm_judge=not args.skip_judge,
     )
 
     if metrics:

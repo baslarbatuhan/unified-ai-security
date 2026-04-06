@@ -70,6 +70,7 @@ class BehaviorRiskResult:
     decision: Decision = "allow"
     confidence: float = 0.0
     evidence: List[str] = field(default_factory=list)
+    latency_ms: Optional[int] = None
 
     # Component scores
     behavior_score: float = 0.0
@@ -82,6 +83,22 @@ class BehaviorRiskResult:
     enum_detected: bool = False
     param_valid: bool = True
 
+    # --- Week 4 additions ---
+    @property
+    def behavior_risk_score(self) -> float:
+        """Unified behavioral risk score (alias for risk_score)."""
+        return self.risk_score
+
+    @property
+    def signals_triggered(self) -> List[str]:
+        """All triggered signal names across all components."""
+        signals = list(self.behavior_signals)
+        if self.enum_detected:
+            signals.append("sequential_enumeration")
+        if not self.param_valid:
+            signals.append("param_violation")
+        return signals
+
     def to_module_risk_dict(self) -> Dict:
         """Export in ModuleRisk-compatible format for fusion gateway."""
         return {
@@ -90,7 +107,27 @@ class BehaviorRiskResult:
             "confidence": round(self.confidence, 4),
             "decision": self.decision,
             "evidence": self.evidence,
-            "latency_ms": None,
+            "latency_ms": self.latency_ms,
+        }
+
+    def to_detailed_dict(self) -> Dict:
+        """Export with full component breakdown for evaluation/logging."""
+        return {
+            "user_id": self.user_id,
+            "tool": self.tool,
+            "behavior_risk_score": round(self.risk_score, 4),
+            "decision": self.decision,
+            "confidence": round(self.confidence, 4),
+            "signals_triggered": self.signals_triggered,
+            "component_scores": {
+                "behavior": round(self.behavior_score, 4),
+                "enum": round(self.enum_score, 4),
+                "param": round(self.param_score, 4),
+            },
+            "behavior_risk_level": self.behavior_risk_level,
+            "enum_detected": self.enum_detected,
+            "param_valid": self.param_valid,
+            "latency_ms": self.latency_ms,
         }
 
 
@@ -149,6 +186,7 @@ class BehaviorRiskModel:
         Returns:
             BehaviorRiskResult with combined risk score and decision.
         """
+        t0 = time.time()
         args = args or {}
         evidence = []
 
@@ -211,6 +249,8 @@ class BehaviorRiskModel:
             f"enum={enum_score:.3f}, param={param_score:.3f}"
         )
 
+        latency_ms = int((time.time() - t0) * 1000)
+
         return BehaviorRiskResult(
             user_id=user_id,
             tool=tool,
@@ -218,6 +258,7 @@ class BehaviorRiskModel:
             decision=decision,
             confidence=confidence,
             evidence=evidence,
+            latency_ms=latency_ms,
             behavior_score=round(behavior_score, 4),
             enum_score=round(enum_score, 4),
             param_score=round(param_score, 4),

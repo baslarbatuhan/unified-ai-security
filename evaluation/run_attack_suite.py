@@ -1,28 +1,26 @@
 """
 evaluation/run_attack_suite.py
 ==================================
-Sistematik saldırı çalıştırıcı.
+Sistematik saldiri calistiricisi (HTTP-only).
 
 Pipeline:
     dataset → request builder → gateway (POST /analyze) → result parser → CSV
 
-Tüm attack datasetlerini sırayla çalıştırır, gateway'e gönderir,
-sonuçları tek CSV'ye yazar.
+Tum attack datasetlerini sirayla calistirir, gateway'e gonderir,
+sonuclari tek CSV'ye yazar.
 
 Datasets:
     1. injection_dataset_v1.csv          → prompt injection attacks
     2. advanced_poison_samples.json      → RAG poisoning attacks
     3. agency_attack_scenarios.json      → tool misuse attacks
 
-Çıktı:
-    runs/fusion_attack_results.csv
+Cikti:
+    runs/gateway_attack_results.csv
 
 Usage:
-    # Gateway çalışıyorken:
+    # Gateway calisiyor olmali:
     python evaluation/run_attack_suite.py
-
-    # Gateway olmadan (doğrudan engine kullanarak):
-    python evaluation/run_attack_suite.py --direct
+    python evaluation/run_attack_suite.py --url http://localhost:8000
 """
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------
-# Request builder
+# Request builders — use new schema format (AnalyzeRequest)
 # ---------------------------------------------------------------------------
 def build_prompt_attacks() -> List[Dict]:
     """Load prompt injection dataset."""
@@ -61,8 +59,8 @@ def build_prompt_attacks() -> List[Dict]:
                     "attack_type": "prompt_injection",
                     "module_targeted": "prompt_guard",
                     "request": {
-                        "user_input": row["prompt"],
-                        "role": "basic",
+                        "prompt": row["prompt"],
+                        "session_context": {"user_id": "attacker", "role": "basic"},
                     },
                     "dataset_source": "injection_dataset_v1.csv",
                 })
@@ -87,9 +85,11 @@ def build_rag_attacks() -> List[Dict]:
                 "attack_type": f"rag_{doc.get('poison_technique', 'unknown')}",
                 "module_targeted": "rag_guard",
                 "request": {
-                    "user_input": doc.get("target_query", "What is the policy?"),
-                    "retrieved_context": doc["content"],
-                    "role": "basic",
+                    "prompt": doc.get("target_query", "What is the policy?"),
+                    "retrieved_docs": [
+                        {"doc_id": doc["doc_id"], "content": doc["content"]},
+                    ],
+                    "session_context": {"user_id": "user_test", "role": "basic"},
                 },
                 "dataset_source": "advanced_poison_samples.json",
             })
@@ -114,10 +114,12 @@ def build_agency_attacks() -> List[Dict]:
                 "attack_type": f"agency_{s['category']}",
                 "module_targeted": "output_agency",
                 "request": {
-                    "user_input": s.get("description", ""),
-                    "tool_call": {"tool": s["tool"], "args": s["args"]},
-                    "user_id": s["user_id"],
-                    "role": s.get("role", "basic"),
+                    "prompt": s.get("description", ""),
+                    "tool_request": {"tool": s["tool"], "params": s["args"]},
+                    "session_context": {
+                        "user_id": s["user_id"],
+                        "role": s.get("role", "basic"),
+                    },
                 },
                 "dataset_source": "agency_attack_scenarios.json",
             })
@@ -125,51 +127,67 @@ def build_agency_attacks() -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Gateway caller
+# Gateway caller (HTTP only)
 # ---------------------------------------------------------------------------
-def call_gateway_http(request: Dict, base_url: str = "http://localhost:8000") -> Dict:
-    """Send request to gateway via HTTP."""
+def call_gateway(request: Dict, base_url: str = "http://localhost:8000") -> Dict:
+    """Send request to gateway via HTTP POST /analyze."""
     import requests as req
     try:
-        resp = req.post(f"{base_url}/analyze", json=request, timeout=30)
+        resp = req.post(f"{base_url}/analyze", json=request, timeout=60)
+        resp.raise_for_status()
         return resp.json()
+    except req.exceptions.HTTPError as e:
+        return {
+            "decision": "error",
+            "fused_risk_score": 0.0,
+            "prompt_score": 0.0,
+            "rag_score": 0.0,
+            "agency_score": 0.0,
+            "evidence": [f"HTTP {resp.status_code}: {resp.text[:200]}"],
+            "module_risks": [],
+            "latency_ms": 0,
+            "error": str(e),
+        }
     except Exception as e:
-        return {"final_decision": "error", "fused_risk": 0.0, "module_risks": [],
-                "latency_ms": 0, "error": str(e)}
-
-
-def call_gateway_direct(request: Dict) -> Dict:
-    """Call engine directly without HTTP."""
-    from fusion_gateway.engine import FusionEngine
-    engine = FusionEngine()
-    response = engine.analyze(
-        user_input=request.get("user_input", ""),
-        retrieved_context=request.get("retrieved_context"),
-        tool_call=request.get("tool_call"),
-        role=request.get("role", "basic"),
-        user_id=request.get("user_id", "anonymous"),
-    )
-    return response.to_dict()
+        return {
+            "decision": "error",
+            "fused_risk_score": 0.0,
+            "prompt_score": 0.0,
+            "rag_score": 0.0,
+            "agency_score": 0.0,
+            "evidence": [str(e)],
+            "module_risks": [],
+            "latency_ms": 0,
+            "error": str(e),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Result parser
+# Result parser — new schema format
 # ---------------------------------------------------------------------------
 def parse_result(attack: Dict, response: Dict) -> Dict:
     """Parse gateway response into CSV row."""
-    module_risks = response.get("module_risks", [])
+    # New schema: direct top-level scores
+    prompt_score = response.get("prompt_score", 0.0)
+    rag_score = response.get("rag_score", 0.0)
+    agency_score = response.get("agency_score", 0.0)
 
-    prompt_score = 0.0
-    rag_score = 0.0
-    agency_score = 0.0
+    # Fallback: extract from module_risks if top-level not present
+    if prompt_score == 0.0 and rag_score == 0.0 and agency_score == 0.0:
+        for m in response.get("module_risks", []):
+            if m.get("module") == "prompt_guard":
+                prompt_score = m.get("risk_score", 0.0)
+            elif m.get("module") == "rag_guard":
+                rag_score = m.get("risk_score", 0.0)
+            elif m.get("module") == "output_agency":
+                agency_score = m.get("risk_score", 0.0)
 
-    for m in module_risks:
-        if m.get("module") == "prompt_guard":
-            prompt_score = m.get("risk_score", 0.0)
-        elif m.get("module") == "rag_guard":
-            rag_score = m.get("risk_score", 0.0)
-        elif m.get("module") == "output_agency":
-            agency_score = m.get("risk_score", 0.0)
+    # Determine override_triggered: check if max-rule override was active
+    fused = response.get("fused_risk_score", response.get("fused_risk", 0.0))
+    module_max = max(prompt_score, rag_score, agency_score)
+    override_triggered = "yes" if module_max >= 0.60 and fused > (
+        0.30 * prompt_score + 0.30 * rag_score + 0.40 * agency_score + 0.01
+    ) else "no"
 
     return {
         "attack_id": attack["attack_id"],
@@ -178,8 +196,9 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
         "module_prompt_score": round(prompt_score, 4),
         "module_rag_score": round(rag_score, 4),
         "module_agency_score": round(agency_score, 4),
-        "fused_risk_score": round(response.get("fused_risk", 0.0), 4),
-        "decision": response.get("final_decision", "error"),
+        "fused_risk_score": round(fused, 4),
+        "override_triggered": override_triggered,
+        "decision": response.get("decision", response.get("final_decision", "error")),
         "latency_ms": response.get("latency_ms", 0),
         "dataset_source": attack["dataset_source"],
     }
@@ -188,12 +207,12 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
 # ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
-def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8000") -> Dict:
-    """Run all attack datasets through the gateway."""
+def run_attack_suite(base_url: str = "http://localhost:8000") -> Dict:
+    """Run all attack datasets through the HTTP gateway."""
 
     print(f"\n{'='*65}")
-    print(f"  ATTACK SUITE RUNNER")
-    print(f"  Mode: {'HTTP → ' + base_url if use_http else 'Direct (no HTTP)'}")
+    print(f"  ATTACK SUITE RUNNER (HTTP)")
+    print(f"  Gateway: {base_url}")
     print(f"{'='*65}")
 
     # Build all attacks
@@ -214,17 +233,20 @@ def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8
 
     print(f"    TOTAL:            {len(all_attacks)} attacks")
 
+    if not all_attacks:
+        print("\n  ERROR: No attacks loaded. Check dataset paths.")
+        return {"error": "no_attacks"}
+
     # Run attacks
     results = []
-    caller = call_gateway_http if use_http else call_gateway_direct
 
     print(f"\n  Running attacks...")
     for i, attack in enumerate(all_attacks):
         t0 = time.time()
-        response = caller(attack["request"])
+        response = call_gateway(attack["request"], base_url)
         elapsed = int((time.time() - t0) * 1000)
 
-        # Override latency if direct mode didn't set it
+        # Override latency if gateway didn't set it
         if response.get("latency_ms", 0) == 0:
             response["latency_ms"] = elapsed
 
@@ -237,6 +259,7 @@ def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8
     # Summary
     decisions = {}
     targeted = {}
+    override_count = 0
     for r in results:
         d = r["decision"]
         decisions[d] = decisions.get(d, 0) + 1
@@ -248,24 +271,28 @@ def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8
             targeted[t]["blocked"] += 1
         else:
             targeted[t]["allowed"] += 1
+        if r["override_triggered"] == "yes":
+            override_count += 1
 
     print(f"\n{'='*65}")
     print(f"  ATTACK SUITE RESULTS")
     print(f"{'='*65}")
     print(f"  Total attacks: {len(results)}")
     print(f"  Decision distribution: {decisions}")
+    print(f"  Override triggered: {override_count}/{len(results)}")
     print(f"\n  Per-module:")
     for mod, stats in targeted.items():
         block_rate = stats["blocked"] / stats["total"] * 100 if stats["total"] > 0 else 0
         print(f"    {mod:20s}: {stats['blocked']}/{stats['total']} blocked ({block_rate:.1f}%)")
 
-    # Save CSV
+    # Save CSV — new filename: gateway_attack_results.csv
     _RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = _RUNS_DIR / "fusion_attack_results.csv"
+    csv_path = _RUNS_DIR / "gateway_attack_results.csv"
     fieldnames = [
         "attack_id", "attack_type", "module_targeted",
         "module_prompt_score", "module_rag_score", "module_agency_score",
-        "fused_risk_score", "decision", "latency_ms", "dataset_source",
+        "fused_risk_score", "override_triggered", "decision",
+        "latency_ms", "dataset_source",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -277,8 +304,9 @@ def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8
         "total_attacks": len(results),
         "decisions": decisions,
         "per_module": targeted,
+        "override_triggered": override_count,
     }
-    summary_path = _RUNS_DIR / "fusion_attack_summary.json"
+    summary_path = _RUNS_DIR / "gateway_attack_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(f"  [Saved] {summary_path}")
@@ -291,11 +319,8 @@ def run_attack_suite(use_http: bool = False, base_url: str = "http://localhost:8
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run attack suite through gateway")
-    parser.add_argument("--http", action="store_true", help="Use HTTP (gateway must be running)")
+    parser = argparse.ArgumentParser(description="Run attack suite through HTTP gateway")
     parser.add_argument("--url", default="http://localhost:8000", help="Gateway URL")
-    parser.add_argument("--direct", action="store_true", default=True, help="Direct engine call (default)")
     args = parser.parse_args()
 
-    use_http = args.http
-    run_attack_suite(use_http=use_http, base_url=args.url)
+    run_attack_suite(base_url=args.url)

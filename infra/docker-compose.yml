@@ -1,14 +1,43 @@
-version: "3.9"
+# Host Ollama often uses 11434; map compose Ollama to 11435 on the host to avoid bind conflicts.
+#
+# GPU: Only Ollama uses GPU for LLM inference. Gateway runs BGE-M3 embeddings on CPU
+#      so that Ollama gets full VRAM. Requires NVIDIA Container Toolkit on host.
+#
+# HF_TOKEN: put `HF_TOKEN=hf_...` in infra/.env (see .env.example) so the gateway container
+# can authenticate to Hugging Face Hub (higher rate limits, no unauthenticated warning).
 services:
   gateway:
-    build: ..
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TORCH_DEVICE: cpu
     ports:
       - "8000:8000"
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - HF_HOME=/app/.cache/huggingface
+      - EMBEDDING_DEVICE=cpu
+      # Same secret; both names are read by huggingface_hub / transformers
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+      - gateway_logs:/app/logs
     depends_on:
-      - chroma
-      - ollama
+      chroma:
+        condition: service_started
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
 
   chroma:
     image: chromadb/chroma:latest
@@ -16,14 +45,46 @@ services:
       - "8001:8000"
     volumes:
       - chroma_data:/chroma/chroma
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
-      - "11434:11434"
+      - "11435:11434"
     volumes:
       - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  # Sandbox container for isolated tool execution
+  sandbox:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TORCH_DEVICE: cpu
+    entrypoint: ["python", "-c", "import time; time.sleep(999999)"]
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    mem_limit: 256m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
 
 volumes:
   chroma_data:
   ollama_data:
+  hf_cache:
+  gateway_logs:

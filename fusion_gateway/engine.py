@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -40,19 +41,44 @@ Decision = Literal["allow", "sanitize", "flag", "block"]
 
 
 # ---------------------------------------------------------------------------
-# Config (from configs/secure_balanced.yaml)
+# Config — load from configs/secure_balanced.yaml, fallback to defaults
 # ---------------------------------------------------------------------------
-DEFAULT_WEIGHTS = {
+_FALLBACK_WEIGHTS = {
     "output_agency": 0.40,
     "prompt_guard": 0.30,
     "rag_guard": 0.30,
 }
 
-DEFAULT_THRESHOLDS = {
+_FALLBACK_THRESHOLDS = {
     "allow": 0.30,
     "sanitize": 0.60,
     "block": 0.85,
 }
+
+
+def _load_yaml_config() -> dict:
+    """Load config from YAML if available, otherwise return empty dict."""
+    config_path = Path(__file__).resolve().parent.parent / "configs" / "secure_balanced.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_config():
+    """Resolve weights and thresholds from YAML config with fallback."""
+    cfg = _load_yaml_config()
+    fusion_cfg = cfg.get("policy", {}).get("fusion", {})
+    weights = fusion_cfg.get("weights", _FALLBACK_WEIGHTS)
+    thresholds = fusion_cfg.get("thresholds", _FALLBACK_THRESHOLDS)
+    return weights, thresholds
+
+
+DEFAULT_WEIGHTS, DEFAULT_THRESHOLDS = _resolve_config()
 
 
 # ---------------------------------------------------------------------------
@@ -100,72 +126,76 @@ class AnalyzeResponse:
 # Module evaluators — singleton instances (loaded once, reused per request)
 # ---------------------------------------------------------------------------
 import sys as _sys
-from pathlib import Path as _Path
 
-_project_root = _Path(__file__).resolve().parent.parent
+_project_root = Path(__file__).resolve().parent.parent
 _sys.path.insert(0, str(_project_root))
 
-_prompt_evaluator = None
-_prompt_pattern_det = None
-_rag_detector = None
-_rag_scorer = None
+_prompt_pipeline = None
+_rag_pipeline = None
 
 
-def _get_prompt_components():
-    global _prompt_evaluator, _prompt_pattern_det
-    if _prompt_evaluator is None:
-        from prompt_guard.semantic_evaluator_v1 import SemanticEvaluator
-        from prompt_guard.pattern_detector import PatternDetector
-        _prompt_evaluator = SemanticEvaluator()
-        _prompt_pattern_det = PatternDetector()
-    return _prompt_evaluator, _prompt_pattern_det
+def _get_prompt_pipeline():
+    global _prompt_pipeline
+    if _prompt_pipeline is None:
+        from prompt_guard.pipeline import PromptGuardPipeline
+        _prompt_pipeline = PromptGuardPipeline()
+    return _prompt_pipeline
 
 
-def _get_rag_components():
-    global _rag_detector, _rag_scorer
-    if _rag_detector is None:
-        from rag_guard.poison_detector import PoisonDetector
-        from rag_guard.retrieval_risk_score import RetrievalRiskScorer
-        _rag_detector = PoisonDetector()
-        _rag_scorer = RetrievalRiskScorer()
-    return _rag_detector, _rag_scorer
+def _build_rag_pipeline_from_yaml() -> Any:
+    """Construct RAGGuardPipeline using modules.rag_guard + llm sections from secure_balanced.yaml."""
+    from rag_guard.pipeline import RAGGuardPipeline
+    from rag_guard.llm_judge import LLMJudge
+
+    cfg = _load_yaml_config()
+    rag = (cfg.get("modules") or {}).get("rag_guard") or {}
+    lj = rag.get("llm_judge") or {}
+    cf = rag.get("context_filter") or {}
+    llm = cfg.get("llm") or {}
+
+    emb_w = float(lj.get("embedding_weight", 0.4))
+    judge_w = float(lj.get("judge_weight", 0.6))
+    removal = float(cf.get("removal_threshold", 0.55))
+    low_c = float(cf.get("low_confidence_threshold", 0.35))
+    min_safe = int(cf.get("min_safe_docs", 2))
+    poison_th = float(rag.get("poison_threshold", removal))
+
+    model = str(llm.get("model") or os.environ.get("LLM_JUDGE_MODEL", "qwen2.5:7b"))
+    fallback = str(llm.get("fallback_model", "llama3.1:8b"))
+    judge = LLMJudge(model=model, fallback_model=fallback)
+
+    return RAGGuardPipeline(
+        judge=judge,
+        embedding_weight=emb_w,
+        judge_weight=judge_w,
+        poison_threshold=poison_th,
+        removal_threshold=removal,
+        low_confidence_threshold=low_c,
+        min_safe_docs=min_safe,
+    )
+
+
+def _get_rag_pipeline():
+    global _rag_pipeline
+    if _rag_pipeline is None:
+        _rag_pipeline = _build_rag_pipeline_from_yaml()
+    return _rag_pipeline
 
 
 def _evaluate_prompt_guard(user_input: str) -> ModuleRisk:
-    """Run prompt guard on user input."""
+    """Run prompt guard pipeline (deobfuscate → normalize → detect → sanitize → risk)."""
     t0 = time.time()
     try:
-        from prompt_guard.prompt_normalizer import normalize_prompt
-
-        evaluator, pattern_det = _get_prompt_components()
-
-        normalized = normalize_prompt(user_input)
-        sem_result = evaluator.evaluate(normalized)
-        sem_score = sem_result.semantic_score
-        pat_result = pattern_det.detect(normalized)
-
-        risk_score = max(sem_score, pat_result.pattern_score)
-        detected = sem_score >= 0.65 or pat_result.is_detected
-
-        evidence = []
-        if detected:
-            evidence.append(f"Injection detected: semantic={sem_score:.3f}, pattern={pat_result.is_detected}")
-            if pat_result.matched_ids:
-                evidence.append(f"Pattern matches: {pat_result.matched_ids}")
-        else:
-            evidence.append(f"No injection: semantic={sem_score:.3f}")
-
-        if sem_score < 0.65 and not pat_result.is_detected:
-            risk_score = risk_score * 0.45
-
-        decision = _threshold_decision(risk_score)
+        pipeline = _get_prompt_pipeline()
+        result = pipeline.run(user_input)
+        risk_dict = result.to_module_risk_dict()
 
         return ModuleRisk(
             module="prompt_guard",
-            risk_score=round(risk_score, 4),
-            confidence=0.85 if detected else 0.90,
-            decision=decision,
-            evidence=evidence,
+            risk_score=risk_dict["risk_score"],
+            confidence=risk_dict["confidence"],
+            decision=risk_dict["decision"],
+            evidence=risk_dict["evidence"],
             latency_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
@@ -176,38 +206,38 @@ def _evaluate_prompt_guard(user_input: str) -> ModuleRisk:
         )
 
 
-def _evaluate_rag_guard(retrieved_context: Optional[str]) -> ModuleRisk:
-    """Run RAG guard on retrieved context."""
+def _evaluate_rag_guard(
+    retrieved_docs: Optional[List[Dict[str, Any]]] = None,
+    retrieved_context: Optional[str] = None,
+    user_query: str = "general query",
+) -> ModuleRisk:
+    """Run RAG guard pipeline (embedding → LLM judge → combine → filter)."""
     t0 = time.time()
-    if not retrieved_context:
+
+    # Build document list from either structured docs or legacy string
+    documents: List[Dict[str, Any]] = []
+    if retrieved_docs:
+        documents = retrieved_docs
+    elif retrieved_context:
+        documents = [{"doc_id": "ctx_0", "content": retrieved_context}]
+
+    if not documents:
         return ModuleRisk(
             module="rag_guard", risk_score=0.0, confidence=0.90,
             decision="allow", evidence=["No context provided"],
             latency_ms=0,
         )
     try:
-        from rag_guard.retrieval_risk_score import DocScore
-
-        detector, risk_scorer = _get_rag_components()
-
-        detection = detector.detect([{"doc_id": "ctx_0", "content": retrieved_context}])
-        doc_score = detection.document_scores[0] if detection.document_scores else None
-        poison_score = doc_score.poison_score if doc_score else 0.0
-
-        risk_result = risk_scorer.score([DocScore(doc_id="ctx_0", poison_score=poison_score, rank=1)])
-
-        evidence = []
-        if poison_score >= 0.55:
-            evidence.append(f"Poison detected: score={poison_score:.3f}")
-        else:
-            evidence.append(f"Context clean: score={poison_score:.3f}")
+        pipeline = _get_rag_pipeline()
+        result = pipeline.run(documents, user_query=user_query)
+        risk_dict = result.to_module_risk_dict()
 
         return ModuleRisk(
             module="rag_guard",
-            risk_score=round(risk_result.risk_score, 4),
-            confidence=round(risk_result.confidence, 2),
-            decision=risk_result.decision,
-            evidence=evidence,
+            risk_score=risk_dict["risk_score"],
+            confidence=risk_dict["confidence"],
+            decision=risk_dict["decision"],
+            evidence=risk_dict["evidence"],
             latency_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:
@@ -216,6 +246,31 @@ def _evaluate_rag_guard(retrieved_context: Optional[str]) -> ModuleRisk:
             decision="allow", evidence=[f"Error: {str(e)}"],
             latency_ms=int((time.time() - t0) * 1000),
         )
+
+
+def _register_gateway_demo_schemas(validator) -> None:
+    """Register all tool parameter schemas used by the gateway demo."""
+    validator.register_tool_schema("get_order", {
+        "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
+    })
+    validator.register_tool_schema("cancel_order", {
+        "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
+        "reason": {"type": "str", "required": False, "max_length": 200},
+    })
+    validator.register_tool_schema("get_ticket", {
+        "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
+    })
+    validator.register_tool_schema("update_ticket", {
+        "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
+        "status": {
+            "type": "str", "required": True,
+            "allowed_values": ["open", "in_progress", "closed"],
+            "denied_values": ["deleted", "purged"],
+        },
+    })
+    validator.register_tool_schema("system_status", {
+        "component": {"type": "str", "required": False, "max_length": 100},
+    })
 
 
 def _evaluate_agency_guard(
@@ -232,11 +287,6 @@ def _evaluate_agency_guard(
             latency_ms=0,
         )
     try:
-        import sys
-        from pathlib import Path
-        project_root = Path(__file__).resolve().parent.parent
-        sys.path.insert(0, str(project_root))
-
         from output_agency_defense.resource_registry import create_demo_registry
         from output_agency_defense.object_authz_guard import ObjectAuthzGuard, Session
         from output_agency_defense.anti_enum_guard import AntiEnumGuard
@@ -246,16 +296,34 @@ def _evaluate_agency_guard(
         authz = ObjectAuthzGuard(registry)
         enum_guard = AntiEnumGuard()
         param_validator = ParameterValidator()
-        param_validator.register_tool_schema("get_order", {
-            "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
-        })
+        _register_gateway_demo_schemas(param_validator)
 
         tool_name = tool_call.get("tool", "")
         args = tool_call.get("args", {})
-        resource_id = args.get("resource_id", "")
+        resource_id = str(args.get("resource_id", "") or "")
 
         evidence = []
         risk_score = 0.0
+
+        # Tool allowlist — derived from _register_gateway_demo_schemas (single source of truth)
+        REGISTERED_TOOLS = set(param_validator._schemas.keys())
+        if not tool_name:
+            risk_score = max(risk_score, 0.90)
+            evidence.append("Empty tool name rejected")
+        elif tool_name not in REGISTERED_TOOLS:
+            risk_score = max(risk_score, 0.95)
+            evidence.append(f"Unregistered tool rejected: '{tool_name}'")
+
+        # Role-based access control
+        ROLE_PERMISSIONS = {
+            "basic": {"get_order", "cancel_order", "get_ticket", "update_ticket", "system_status"},
+            "viewer": {"get_order", "get_ticket", "system_status"},
+            "admin": REGISTERED_TOOLS,
+        }
+        allowed_tools = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["basic"])
+        if tool_name in REGISTERED_TOOLS and tool_name not in allowed_tools:
+            risk_score = max(risk_score, 0.85)
+            evidence.append(f"Role '{role}' not authorized for tool '{tool_name}'")
 
         # Param validation
         param_result = param_validator.validate(tool_name, args)
@@ -332,14 +400,19 @@ class FusionEngine:
         self,
         weights: Optional[Dict[str, float]] = None,
         thresholds: Optional[Dict[str, float]] = None,
+        parallel: bool = True,
+        max_workers: int = 3,
     ):
         self.weights = weights or DEFAULT_WEIGHTS
         self.thresholds = thresholds or DEFAULT_THRESHOLDS
+        self.parallel = parallel
+        self.max_workers = max_workers
 
     def analyze(
         self,
         user_input: str = "",
         retrieved_context: Optional[str] = None,
+        retrieved_docs: Optional[List[Dict[str, Any]]] = None,
         tool_call: Optional[Dict] = None,
         role: str = "basic",
         user_id: str = "anonymous",
@@ -349,7 +422,8 @@ class FusionEngine:
 
         Args:
             user_input:        User's prompt text
-            retrieved_context: RAG retrieval context (if any)
+            retrieved_context: RAG retrieval context as single string (legacy)
+            retrieved_docs:    RAG retrieved documents as list of dicts (preferred)
             tool_call:         Tool call dict with 'tool' and 'args' (if any)
             role:              User role
             user_id:           User identifier
@@ -359,10 +433,20 @@ class FusionEngine:
         """
         t0 = time.time()
 
-        # Run modules
-        prompt_risk = _evaluate_prompt_guard(user_input)
-        rag_risk = _evaluate_rag_guard(retrieved_context)
-        agency_risk = _evaluate_agency_guard(tool_call, user_id, role)
+        # Run modules (parallel or sequential)
+        if self.parallel:
+            prompt_risk, rag_risk, agency_risk = self._run_parallel(
+                user_input, retrieved_context, retrieved_docs,
+                tool_call, user_id, role
+            )
+        else:
+            prompt_risk = _evaluate_prompt_guard(user_input)
+            rag_risk = _evaluate_rag_guard(
+                retrieved_docs=retrieved_docs,
+                retrieved_context=retrieved_context,
+                user_query=user_input,
+            )
+            agency_risk = _evaluate_agency_guard(tool_call, user_id, role)
 
         # Weighted sum
         fused = (
@@ -404,13 +488,55 @@ class FusionEngine:
             latency_ms=total_latency,
         )
 
+    def _run_parallel(
+        self,
+        user_input: str,
+        retrieved_context: Optional[str],
+        retrieved_docs: Optional[List[Dict[str, Any]]],
+        tool_call: Optional[Dict],
+        user_id: str,
+        role: str,
+        timeout: int = 60,
+    ) -> tuple:
+        """Run all 3 modules in parallel using ThreadPoolExecutor."""
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_prompt = executor.submit(_evaluate_prompt_guard, user_input)
+            future_rag = executor.submit(
+                _evaluate_rag_guard,
+                retrieved_docs=retrieved_docs,
+                retrieved_context=retrieved_context,
+                user_query=user_input,
+            )
+            future_agency = executor.submit(_evaluate_agency_guard, tool_call, user_id, role)
+
+            def _safe_result(future, module_name: str) -> ModuleRisk:
+                try:
+                    return future.result(timeout=timeout)
+                except Exception as e:
+                    return ModuleRisk(
+                        module=module_name, risk_score=0.0, confidence=0.0,
+                        decision="allow", evidence=[f"Timeout/error: {e}"],
+                    )
+
+            prompt_risk = _safe_result(future_prompt, "prompt_guard")
+            rag_risk = _safe_result(future_rag, "rag_guard")
+            agency_risk = _safe_result(future_agency, "output_agency")
+
+        return prompt_risk, rag_risk, agency_risk
+
     def analyze_prompt_only(self, user_input: str) -> AnalyzeResponse:
         """Shortcut: evaluate only prompt guard."""
         return self.analyze(user_input=user_input)
 
     def analyze_with_context(self, user_input: str, context: str) -> AnalyzeResponse:
-        """Shortcut: evaluate prompt + RAG guard."""
+        """Shortcut: evaluate prompt + RAG guard (legacy string)."""
         return self.analyze(user_input=user_input, retrieved_context=context)
+
+    def analyze_with_docs(
+        self, user_input: str, docs: List[Dict[str, Any]]
+    ) -> AnalyzeResponse:
+        """Shortcut: evaluate prompt + RAG guard (structured docs)."""
+        return self.analyze(user_input=user_input, retrieved_docs=docs)
 
 
 # ---------------------------------------------------------------------------

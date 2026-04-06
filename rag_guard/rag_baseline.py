@@ -50,9 +50,19 @@ try:
 except ImportError:
     sys.exit("sentence-transformers not installed. Run:  pip install sentence-transformers")
 
+import os
 import torch
 
 def _get_device() -> str:
+    if not os.environ.get("EMBEDDING_DEVICE"):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+        except ImportError:
+            pass
+    forced = os.environ.get("EMBEDDING_DEVICE", "").lower()
+    if forced in ("cpu", "cuda"):
+        return forced
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"

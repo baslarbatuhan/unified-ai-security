@@ -42,7 +42,10 @@ class ParamSchema:
     required: bool = True
     max_length: int = 200
     pattern: Optional[str] = None  # regex for format validation
-    allowed_values: Optional[List] = None
+    allowed_values: Optional[List] = None   # allowlist: only these values accepted
+    denied_values: Optional[List] = None    # denylist: these values always rejected
+    min_value: Optional[float] = None       # numeric min (inclusive)
+    max_value: Optional[float] = None       # numeric max (inclusive)
 
 
 @dataclass
@@ -74,7 +77,12 @@ class ParameterValidator:
         self._schemas: Dict[str, List[ParamSchema]] = {}
 
     def register_tool_schema(self, tool_name: str, params: Dict[str, Dict]):
-        """Register parameter schema for a tool."""
+        """Register parameter schema for a tool.
+
+        Each param spec supports:
+            type, required, max_length, pattern,
+            allowed_values (allowlist), denied_values (denylist)
+        """
         schemas = []
         for name, spec in params.items():
             schemas.append(ParamSchema(
@@ -84,12 +92,23 @@ class ParameterValidator:
                 max_length=spec.get("max_length", 200),
                 pattern=spec.get("pattern"),
                 allowed_values=spec.get("allowed_values"),
+                denied_values=spec.get("denied_values"),
+                min_value=spec.get("min_value"),
+                max_value=spec.get("max_value"),
             ))
         self._schemas[tool_name] = schemas
 
     def validate(self, tool_name: str, args: Dict[str, Any]) -> ValidationResult:
         """
         Validate parameters against registered schema.
+
+        Checks (in order):
+        1. Unexpected parameters (not in schema) → rejected
+        2. Required parameters present
+        3. Type correctness
+        4. String: max_length, format pattern, suspicious content
+        5. Denylist (always rejected values)
+        6. Allowlist (only accepted values)
 
         Returns ValidationResult with violations list.
         """
@@ -99,6 +118,12 @@ class ParameterValidator:
         if schemas is None:
             return ValidationResult(decision="allow", tool=tool_name, is_valid=True,
                                     violations=["No schema registered, skipping validation"])
+
+        # --- Unexpected parameter rejection ---
+        known_names = {s.name for s in schemas}
+        unexpected = set(args.keys()) - known_names
+        for param_name in sorted(unexpected):
+            violations.append(f"Unexpected parameter: '{param_name}' is not in tool schema")
 
         for schema in schemas:
             value = args.get(schema.name)
@@ -118,6 +143,13 @@ class ParameterValidator:
                 violations.append(f"Wrong type for '{schema.name}': expected {schema.type}, got {type(value).__name__}")
                 continue
 
+            # Numeric range checks
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if schema.min_value is not None and value < schema.min_value:
+                    violations.append(f"Parameter '{schema.name}' below minimum: {value} < {schema.min_value}")
+                if schema.max_value is not None and value > schema.max_value:
+                    violations.append(f"Parameter '{schema.name}' above maximum: {value} > {schema.max_value}")
+
             # String-specific checks
             if isinstance(value, str):
                 # Max length
@@ -133,7 +165,11 @@ class ParameterValidator:
                     if pattern.search(value):
                         violations.append(f"Suspicious content in '{schema.name}': {attack_type} detected")
 
-            # Allowed values
+            # Denylist check (before allowlist — explicit deny always wins)
+            if schema.denied_values and value in schema.denied_values:
+                violations.append(f"Parameter '{schema.name}' contains denied value: '{value}'")
+
+            # Allowlist check
             if schema.allowed_values and value not in schema.allowed_values:
                 violations.append(f"Parameter '{schema.name}' value not allowed: '{value}'")
 
@@ -161,7 +197,11 @@ if __name__ == "__main__":
     })
     validator.register_tool_schema("update_ticket", {
         "resource_id": {"type": "str", "required": True, "max_length": 50, "pattern": r"^[A-Z]+-\d+$"},
-        "status": {"type": "str", "required": True, "allowed_values": ["open", "in_progress", "closed"]},
+        "status": {
+            "type": "str", "required": True,
+            "allowed_values": ["open", "in_progress", "closed"],
+            "denied_values": ["deleted", "purged"],
+        },
     })
 
     tests = [
@@ -173,6 +213,8 @@ if __name__ == "__main__":
         ("Too long", "get_order", {"resource_id": "ORD-" + "A" * 200}),
         ("Valid ticket update", "update_ticket", {"resource_id": "TKT-101", "status": "closed"}),
         ("Invalid status", "update_ticket", {"resource_id": "TKT-101", "status": "deleted"}),
+        ("Denied status", "update_ticket", {"resource_id": "TKT-101", "status": "purged"}),
+        ("Unexpected param", "get_order", {"resource_id": "ORD-001", "debug": "true", "admin": "1"}),
         ("Null resource_id", "get_order", {"resource_id": None}),
     ]
 

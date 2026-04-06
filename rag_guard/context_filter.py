@@ -23,7 +23,9 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
+
+ContextPolicy = Literal["none", "sanitize", "block"]
 
 try:
     from rag_guard.poison_detector import PoisonDetector, DetectionResult
@@ -36,9 +38,9 @@ class FilteredDoc:
     """A document after filtering."""
     doc_id: str
     content: str
-    is_original: bool     # True if kept as-is, False if sanitized
+    is_original: bool     # True if kept as-is, False if sanitized/removed
     poison_score: float
-    action: str           # "kept", "removed", "sanitized"
+    action: str           # "kept", "removed", "demoted"
 
 
 @dataclass
@@ -52,6 +54,9 @@ class SanitizationResult:
     sanitization_ratio: float = 0.0
     needs_review: bool = False
     evidence: List[str] = field(default_factory=list)
+    insufficient_clean_docs: bool = False
+    context_policy: ContextPolicy = "none"
+    safe_clean_count: int = 0
 
 
 class ContextFilter:
@@ -69,17 +74,23 @@ class ContextFilter:
         self,
         detector: Optional[PoisonDetector] = None,
         removal_threshold: float = 0.55,
+        low_confidence_threshold: float = 0.35,
         review_ratio: float = 0.50,
+        min_safe_docs: int = 2,
     ):
         """
         Args:
-            detector:          PoisonDetector instance
-            removal_threshold: Poison score above which a doc is removed
-            review_ratio:      If more than this ratio is removed, flag for review
+            detector:                 PoisonDetector instance
+            removal_threshold:        Poison score above which a doc is removed
+            low_confidence_threshold: Score between this and removal_threshold → demoted (kept but downranked)
+            review_ratio:             If more than this ratio is removed, flag for review
+            min_safe_docs:            Minimum clean docs required; if fewer, flag for review
         """
         self.detector = detector or PoisonDetector()
         self.removal_threshold = removal_threshold
+        self.low_confidence_threshold = low_confidence_threshold
         self.review_ratio = review_ratio
+        self.min_safe_docs = min_safe_docs
 
     def sanitize(self, documents: List[Dict]) -> SanitizationResult:
         """
@@ -96,6 +107,9 @@ class ContextFilter:
                 original_count=0, kept_count=0, removed_count=0,
                 filtered_context="No documents retrieved.",
                 evidence=["Empty retrieval result"],
+                insufficient_clean_docs=False,
+                context_policy="none",
+                safe_clean_count=0,
             )
 
         # Run poison detection
@@ -103,10 +117,15 @@ class ContextFilter:
                           for i, d in enumerate(documents)]
         detection = self.detector.detect(detector_input)
 
-        # Filter based on scores
+        # Filter based on scores — three tiers:
+        #   score >= removal_threshold       → removed
+        #   score >= low_confidence_threshold → demoted (kept but downranked)
+        #   score < low_confidence_threshold  → kept as-is
         filtered_docs = []
-        kept_docs = []
+        kept_docs = []       # clean docs (kept as-is)
+        demoted_docs = []    # low confidence docs (kept but after clean docs)
         removed_count = 0
+        demoted_count = 0
         evidence = []
 
         for i, doc_score in enumerate(detection.document_scores):
@@ -127,6 +146,19 @@ class ContextFilter:
                 )
                 if doc_score.pattern_matches:
                     evidence.append(f"  Patterns: {', '.join(doc_score.pattern_matches)}")
+
+            elif doc_score.poison_score >= self.low_confidence_threshold:
+                # Demote: keep but place after clean docs
+                filtered_docs.append(FilteredDoc(
+                    doc_id=doc_id, content=content,
+                    is_original=False, poison_score=doc_score.poison_score, action="demoted",
+                ))
+                demoted_docs.append(content)
+                demoted_count += 1
+                evidence.append(
+                    f"Demoted '{doc_id}': poison_score={doc_score.poison_score:.3f} "
+                    f"(low confidence zone {self.low_confidence_threshold}-{self.removal_threshold})"
+                )
             else:
                 # Keep this document
                 filtered_docs.append(FilteredDoc(
@@ -135,9 +167,10 @@ class ContextFilter:
                 ))
                 kept_docs.append(content)
 
-        # Build filtered context
-        if kept_docs:
-            context_parts = [f"[Document {i+1}]: {content}" for i, content in enumerate(kept_docs)]
+        # Build filtered context: clean docs first, demoted docs after
+        all_safe = kept_docs + demoted_docs
+        if all_safe:
+            context_parts = [f"[Document {i+1}]: {content}" for i, content in enumerate(all_safe)]
             filtered_context = "\n\n".join(context_parts)
         else:
             filtered_context = "All retrieved documents were flagged as suspicious. Please verify your query or consult the source materials directly."
@@ -145,26 +178,46 @@ class ContextFilter:
         # Check if review needed
         original_count = len(documents)
         sanitization_ratio = removed_count / original_count if original_count > 0 else 0
+        safe_count = len(kept_docs)
         needs_review = sanitization_ratio >= self.review_ratio
 
-        if needs_review:
+        insufficient_clean = False
+        context_policy: ContextPolicy = "none"
+        if safe_count < self.min_safe_docs and original_count >= self.min_safe_docs:
+            insufficient_clean = True
+            needs_review = True
+            context_policy = "block" if safe_count == 0 else "sanitize"
+            evidence.append(
+                f"INSUFFICIENT CLEAN DOCS: {safe_count} fully clean docs < "
+                f"min_safe_docs={self.min_safe_docs} → policy={context_policy}."
+            )
+
+        if needs_review and sanitization_ratio >= self.review_ratio:
             evidence.append(
                 f"HIGH REMOVAL RATE: {removed_count}/{original_count} documents removed "
                 f"({sanitization_ratio:.0%}). Manual review recommended."
             )
 
-        if removed_count == 0:
-            evidence.append("No documents removed. All content passed poison detection.")
+        if demoted_count > 0:
+            evidence.append(
+                f"{demoted_count} document(s) demoted (low confidence, placed after clean docs)"
+            )
+
+        if removed_count == 0 and demoted_count == 0:
+            evidence.append("No documents removed or demoted. All content passed poison detection.")
 
         return SanitizationResult(
             original_count=original_count,
-            kept_count=original_count - removed_count,
+            kept_count=safe_count + demoted_count,
             removed_count=removed_count,
             filtered_docs=filtered_docs,
             filtered_context=filtered_context,
             sanitization_ratio=round(sanitization_ratio, 4),
             needs_review=needs_review,
             evidence=evidence,
+            insufficient_clean_docs=insufficient_clean,
+            context_policy=context_policy,
+            safe_clean_count=safe_count,
         )
 
 

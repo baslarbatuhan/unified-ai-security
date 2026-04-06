@@ -15,6 +15,7 @@ get-pip.py
 
 # ── Secrets / Environment ──────────────────────────────
 .env
+infra/.env
 *.pem
 *.key
 
@@ -44,4 +45,3 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
-PROJECT_README.md

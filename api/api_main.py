@@ -32,10 +32,18 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 
 from fusion_gateway.engine import FusionEngine
+from api.security_gateway import SecurityGateway
+from api.health import get_health_report
+from schemas.risk_schema import (
+    AnalyzeRequest as SchemaRequest,
+    AnalyzeResponse as SchemaResponse,
+    ToolRequest,
+    SessionContext,
+)
 
 
 # ---------------------------------------------------------------------------
-# Pydantic models (compatible with schemas/risk_schema.py)
+# Pydantic models — legacy format (backward compat for existing clients)
 # ---------------------------------------------------------------------------
 class AnalyzeRequestModel(BaseModel):
     user_input: str = ""
@@ -44,25 +52,31 @@ class AnalyzeRequestModel(BaseModel):
     role: str = "basic"
     user_id: str = "anonymous"
 
-
-class ModuleRiskModel(BaseModel):
-    module: str
-    risk_score: float
-    confidence: float
-    decision: str
-    evidence: List[str] = []
-    latency_ms: Optional[int] = None
+    # New format fields (optional, preferred)
+    prompt: Optional[str] = None
+    retrieved_docs: Optional[List[Dict[str, Any]]] = None
+    context: Optional[str] = None
+    tool_request: Optional[Dict[str, Any]] = None
+    tool_candidates: Optional[List[Dict[str, Any]]] = None
+    session_context: Optional[Dict[str, Any]] = None
 
 
 class AnalyzeResponseModel(BaseModel):
     final_decision: str
     fused_risk: float
+    prompt_score: float = 0.0
+    rag_score: float = 0.0
+    agency_score: float = 0.0
+    evidence: List[str] = []
     module_risks: List[Dict[str, Any]]
     latency_ms: int
 
 
 class HealthResponse(BaseModel):
     status: str
+    passed: int = 0
+    failed: int = 0
+    total: int = 0
     checks: List[Dict[str, Any]] = []
 
 
@@ -72,10 +86,11 @@ class HealthResponse(BaseModel):
 app = FastAPI(
     title="Unified AI Security Gateway",
     description="3 modül (prompt_guard, rag_guard, output_agency) → fusion → karar",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 engine = FusionEngine()
+gateway = SecurityGateway(engine)
 
 
 # ---------------------------------------------------------------------------
@@ -119,27 +134,69 @@ async def analyze(request: AnalyzeRequestModel):
     """
     Ana endpoint: Tam güvenlik analizi.
 
-    Request body:
-        user_input:        Kullanıcı promptu
-        retrieved_context: RAG retrieval sonucu (opsiyonel)
-        tool_call:         Tool çağrısı {"tool": "...", "args": {...}} (opsiyonel)
-        role:              Kullanıcı rolü (default: "basic")
-        user_id:           Kullanıcı ID (default: "anonymous")
+    Supports both legacy and new request formats:
 
-    Response:
-        final_decision:  allow / sanitize / flag / block
-        fused_risk:      0.0 - 1.0
-        module_risks:    3 modülün ayrı ayrı sonuçları
-        latency_ms:      Toplam işlem süresi
+    Legacy:
+        user_input, retrieved_context, tool_call, role, user_id
+
+    New (preferred):
+        prompt, retrieved_docs, tool_request, session_context
     """
-    response = engine.analyze(
-        user_input=request.user_input,
-        retrieved_context=request.retrieved_context,
-        tool_call=request.tool_call,
-        role=request.role,
-        user_id=request.user_id,
+    # Build SchemaRequest — prefer new fields, fall back to legacy
+    prompt = request.prompt or request.user_input or ""
+
+    # Session context
+    if request.session_context:
+        session = SessionContext(**request.session_context)
+    else:
+        session = SessionContext(user_id=request.user_id, role=request.role)
+
+    # Tool request (first tool_candidates entry if no explicit tool_request)
+    tool_req = None
+    if request.tool_request:
+        tool_req = ToolRequest(**request.tool_request)
+    elif request.tool_candidates:
+        tool_req = ToolRequest(**request.tool_candidates[0])
+    elif request.tool_call:
+        tool_req = ToolRequest(
+            tool=request.tool_call.get("tool", ""),
+            params=request.tool_call.get("args", {}),
+        )
+
+    tool_candidates_typed = None
+    if request.tool_candidates:
+        tool_candidates_typed = [ToolRequest(**t) for t in request.tool_candidates]
+
+    # Retrieved docs / context
+    retrieved_docs = request.retrieved_docs
+    plain_context = None
+    if retrieved_docs is None:
+        if request.context:
+            plain_context = request.context
+        elif request.retrieved_context:
+            retrieved_docs = [{"doc_id": "ctx_0", "content": request.retrieved_context}]
+
+    schema_request = SchemaRequest(
+        prompt=prompt,
+        retrieved_docs=retrieved_docs,
+        context=plain_context,
+        tool_request=tool_req,
+        tool_candidates=tool_candidates_typed,
+        session_context=session,
     )
-    return response.to_dict()
+
+    response = gateway.analyze(schema_request)
+
+    return {
+        "final_decision": response.decision,
+        "fused_risk": response.fused_risk_score,
+        "prompt_score": response.prompt_score,
+        "rag_score": response.rag_score,
+        "agency_score": response.agency_score,
+        "evidence": response.evidence,
+        "module_risks": [mr.model_dump() for mr in response.module_risks],
+        "latency_ms": response.latency_ms or 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -147,18 +204,26 @@ async def analyze(request: AnalyzeRequestModel):
 # ---------------------------------------------------------------------------
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Sistem sağlığı kontrolü."""
+    """Expanded health check: active_guards, wrapper_coverage, chroma, ollama, fusion."""
     try:
-        from evaluation.security_healthcheck import run_healthcheck
-        result = run_healthcheck()
+        report = get_health_report()
         return {
-            "status": result.overall_status,
-            "checks": result.checks,
+            "status": report.status,
+            "passed": report.passed,
+            "failed": report.failed,
+            "total": report.total,
+            "checks": [
+                {"name": c.name, "status": c.status, "detail": c.detail, "latency_ms": c.latency_ms}
+                for c in report.checks
+            ],
         }
     except Exception as e:
         return {
-            "status": "DEGRADED",
-            "checks": [{"name": "healthcheck", "status": "FAIL", "detail": str(e)}],
+            "status": "CRITICAL",
+            "passed": 0,
+            "failed": 1,
+            "total": 1,
+            "checks": [{"name": "healthcheck", "status": "FAIL", "detail": str(e), "latency_ms": 0}],
         }
 
 

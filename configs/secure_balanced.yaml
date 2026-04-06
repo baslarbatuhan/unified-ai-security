@@ -1,7 +1,11 @@
-# Example config preset
+# Fusion Gateway — secure balanced configuration
+# ================================================
+# This file is loaded by fusion_gateway/engine.py at startup.
+
 llm:
   provider: ollama
   model: qwen2.5:7b
+  fallback_model: llama3.1:8b
 
 vector_db:
   type: chromadb
@@ -17,11 +21,25 @@ policy:
       allow: 0.30
       sanitize: 0.60
       block: 0.85
+    # Max-rule override: prevents fusion dilution when a single module
+    # flags a critical threat.
+    override:
+      critical_threshold: 0.85   # module >= this → fused = max(fused, score*0.90)
+      elevated_threshold: 0.60   # module >= this → fused = max(fused, score*0.75)
 
 modules:
   output_agency:
     enabled: true
   prompt_guard:
     enabled: true
+    semantic_threshold: 0.65
   rag_guard:
     enabled: true
+    poison_threshold: 0.55
+    llm_judge:
+      embedding_weight: 0.4
+      judge_weight: 0.6
+    context_filter:
+      removal_threshold: 0.55
+      low_confidence_threshold: 0.35
+      min_safe_docs: 2

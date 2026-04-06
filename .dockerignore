@@ -1,0 +1,24 @@
+# Keep Docker build context small (avoid multi-GB .venv / caches)
+.venv
+venv
+__pycache__
+*.py[cod]
+.git
+.gitignore
+.ruff_cache
+.mypy_cache
+.pytest_cache
+*.egg-info
+dist
+build
+runs
+.env
+.env.*
+*.md
+!README.md
+terminals
+.cursor
+.mcps
+datasets/**/*.bin
+**/.huggingface
+**/.cache

@@ -36,26 +36,32 @@ def load_prompt_results() -> List[Dict]:
     """Load prompt injection + evasion results."""
     rows = []
 
-    # Hafta 2 combined results
-    csv_path = _RUNS_DIR / "prompt_metrics.csv"
+    # Pipeline results (Week 4 — preferred if available)
+    pipeline_path = _RUNS_DIR / "pipeline_prompt_metrics.csv"
+    # Fallback: test runner results
+    test_path = _RUNS_DIR / "prompt_metrics.csv"
+    csv_path = pipeline_path if pipeline_path.exists() else test_path
+
     if csv_path.exists():
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for i, r in enumerate(reader):
-                if r.get("label", r.get("is_attack", "0")) == "1":
+                # Support both formats: pipeline (label) and test (actual_label)
+                label = r.get("label", r.get("actual_label", r.get("is_attack", "0")))
+                if label == "1":
                     detected = r.get("combined_detected", r.get("detected", "False"))
-                    decision = "block" if detected == "True" else "allow"
+                    decision = "block" if detected == "True" else r.get("decision", "allow")
                     rows.append({
                         "attack_id": f"PI-{i+1:03d}",
                         "attack_type": "prompt_injection",
                         "module_targeted": "prompt_guard",
-                        "input_artifact": (r.get("prompt", "")[:80] + "...") if len(r.get("prompt", "")) > 80 else r.get("prompt", ""),
+                        "input_artifact": (r.get("prompt", r.get("test_case", ""))[:80] + "...") if len(r.get("prompt", r.get("test_case", ""))) > 80 else r.get("prompt", r.get("test_case", "")),
                         "expected_defense": "block",
                         "observed_decision": decision,
                         "risk_score": r.get("risk_score", r.get("combined_score", "0")),
                         "success_or_failure": "success" if decision in ("block", "flag", "sanitize") else "failure",
                         "dataset_source": "injection_dataset_v1.csv",
-                        "notes": f"semantic+pattern combined",
+                        "notes": f"source={csv_path.name}",
                     })
 
     # Hafta 3 evasion results
@@ -85,25 +91,35 @@ def load_rag_results() -> List[Dict]:
     """Load RAG poisoning results."""
     rows = []
 
-    # Hafta 2 original
-    csv_path = _RUNS_DIR / "rag_metrics.csv"
+    # Pipeline results (Week 4 — preferred if available)
+    pipeline_path = _RUNS_DIR / "pipeline_rag_metrics.csv"
+    # Fallback: test runner results
+    test_path = _RUNS_DIR / "rag_metrics.csv"
+    csv_path = pipeline_path if pipeline_path.exists() else test_path
+
     if csv_path.exists():
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
-                if r.get("is_poisoned", "False") == "True":
+                # Support both formats: pipeline (is_poisoned) and test (actual_label)
+                is_poisoned = r.get("is_poisoned", "False")
+                if is_poisoned == "False":
+                    is_poisoned = "True" if r.get("actual_label", "0") == "1" else "False"
+                if is_poisoned == "True":
                     detected = r.get("detected", "False") == "True"
+                    if not detected:
+                        detected = r.get("predicted_label", "0") == "1"
                     rows.append({
-                        "attack_id": r.get("test_case", r.get("doc_id", "")),
-                        "attack_type": f"rag_{r.get('poison_type', 'unknown')}",
+                        "attack_id": r.get("doc_id", r.get("test_case", "")),
+                        "attack_type": f"rag_{r.get('poison_type', r.get('poison_technique', 'unknown'))}",
                         "module_targeted": "rag_guard",
-                        "input_artifact": r.get("test_case", "")[:80],
+                        "input_artifact": r.get("doc_id", r.get("test_case", ""))[:80],
                         "expected_defense": "sanitize",
                         "observed_decision": r.get("decision", "allow"),
                         "risk_score": r.get("risk_score", "0"),
                         "success_or_failure": "success" if detected else "failure",
-                        "dataset_source": "poison_samples.json",
-                        "notes": f"poison_score={r.get('poison_score', '')}",
+                        "dataset_source": f"poison_samples.json ({csv_path.name})",
+                        "notes": f"poison_score={r.get('combined_score', r.get('poison_score', ''))}",
                     })
 
     # Hafta 3 advanced
@@ -134,25 +150,31 @@ def load_agency_results() -> List[Dict]:
     """Load agency attack results."""
     rows = []
 
-    # Hafta 2 hardcoded
-    csv_path = _RUNS_DIR / "agency_metrics.csv"
+    # Pipeline results (Week 4 with LLM — preferred if available)
+    pipeline_path = _RUNS_DIR / "pipeline_agency_metrics.csv"
+    # Fallback: test runner results
+    test_path = _RUNS_DIR / "agency_metrics.csv"
+    csv_path = pipeline_path if pipeline_path.exists() else test_path
+
     if csv_path.exists():
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
-                if r.get("expected", "") == "block":
+                # Support both formats: pipeline (expected_decision) and test (expected)
+                expected = r.get("expected_decision", r.get("expected", ""))
+                if expected == "block":
                     correct = r.get("correct", "False") == "True"
                     rows.append({
-                        "attack_id": f"AG-HC-{r.get('test_case', '')[:20]}",
-                        "attack_type": f"agency_{r.get('test_category', 'unknown')}",
+                        "attack_id": f"AG-{r.get('scenario_id', r.get('test_case', ''))[:20]}",
+                        "attack_type": f"agency_{r.get('category', r.get('test_category', 'unknown'))}",
                         "module_targeted": "output_agency",
-                        "input_artifact": r.get("test_case", "")[:80],
+                        "input_artifact": r.get("scenario_id", r.get("test_case", ""))[:80],
                         "expected_defense": "block",
                         "observed_decision": r.get("decision", "allow"),
                         "risk_score": r.get("risk_score", "0"),
                         "success_or_failure": "success" if correct else "failure",
-                        "dataset_source": "test_id_enumeration.py (hardcoded)",
-                        "notes": f"category={r.get('test_category', '')}",
+                        "dataset_source": f"{csv_path.name}",
+                        "notes": f"category={r.get('category', r.get('test_category', ''))}",
                     })
 
     # Hafta 3 dataset-driven
