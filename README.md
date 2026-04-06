@@ -134,7 +134,7 @@ python tests/test_id_enumeration.py
 python tests/test_behavior_monitor.py
 
 # Attack suite (requires running gateway)
-python evaluation/run_attack_suite.py --http
+python evaluation/run_attack_suite.py --url http://localhost:8000
 
 # Generate metrics (requires Ollama for RAG + Agency LLM)
 python evaluation/generate_metrics.py
@@ -194,7 +194,6 @@ modules:
 | Variable | Local (.env) | Docker (compose) | Purpose |
 |----------|-------------|-------------------|---------|
 | `HF_TOKEN` | `.env` | `infra/.env` | Hugging Face model downloads |
-| `EMBEDDING_DEVICE` | `cpu` | `cpu` | Force embeddings to CPU (GPU for Ollama) |
 | `OLLAMA_HOST` | `http://localhost:11434` | `http://ollama:11434` | LLM inference endpoint |
 | `CHROMA_HOST` | `localhost` | `chroma` | Vector store |
 

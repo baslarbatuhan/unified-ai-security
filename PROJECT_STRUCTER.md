@@ -225,7 +225,7 @@ tool_call → authz_guard → enum_guard → param_validation → behavior_monit
 
 | Script | Command | Output |
 |--------|---------|--------|
-| Attack Suite | `python evaluation/run_attack_suite.py --http` | `runs/fusion_attack_results.csv` |
+| Attack Suite | `python evaluation/run_attack_suite.py --url http://localhost:8000` | `runs/gateway_attack_results.csv` (+ `runs/gateway_attack_summary.json`) |
 | Attack Matrix | `python evaluation/generate_attack_matrix.py` | `reports/attack_matrix.csv` |
 | Threshold Sweep | `python evaluation/fusion_threshold_optimization.py` | `runs/fusion_threshold_analysis.csv` |
 | Healthcheck | `python evaluation/security_healthcheck.py` | `runs/security_healthcheck.json` |

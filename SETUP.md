@@ -63,14 +63,12 @@ Edit `.env`:
 ```
 HF_TOKEN=hf_your_token_here
 HF_HOME=.cache/huggingface
-EMBEDDING_DEVICE=cpu
 ```
 
 | Variable | Purpose |
 |----------|---------|
 | `HF_TOKEN` | Hugging Face token for faster model downloads (get from https://huggingface.co/settings/tokens) |
 | `HF_HOME` | Local cache directory for HF models |
-| `EMBEDDING_DEVICE` | `cpu` = embeddings on CPU (recommended), `cuda` = embeddings on GPU |
 
 > `.env` is in `.gitignore` — it will never be committed.
 
@@ -140,15 +138,15 @@ docker compose up --build -d
 | Sandbox | — | isolated |
 
 GPU allocation in Docker:
-- **Ollama**: Full GPU access (`runtime: nvidia`)
-- **Gateway**: CPU only (`EMBEDDING_DEVICE=cpu`)
+- **Ollama**: GPU access (`gpus: all`)
+- **Gateway**: GPU access (`gpus: all`, CUDA-enabled torch image)
 - **Sandbox**: No GPU, no network, read-only filesystem
 
 ## 11. Generate Evaluation Outputs
 
 ```bash
 # Requires running gateway + Ollama
-python evaluation/run_attack_suite.py --http
+python evaluation/run_attack_suite.py --url http://localhost:8000
 python evaluation/generate_metrics.py
 python evaluation/fusion_threshold_optimization.py
 ```
