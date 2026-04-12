@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from prompt_guard.deobfuscator import deobfuscate, get_deobfuscation_report
@@ -109,12 +109,17 @@ class PromptGuardPipeline:
         sanitizer: Optional[PromptSanitizer] = None,
         risk_scorer: Optional[PromptRiskScorer] = None,
         semantic_threshold: float = 0.65,
+        adaptive_tier_thresholds: Optional[Tuple[float, float, float]] = None,
+        adaptive_len_breakpoints: Tuple[int, int] = (50, 200),
     ):
         self.evaluator = evaluator or SemanticEvaluator(threshold=semantic_threshold)
         self.pattern_detector = pattern_detector or PatternDetector()
         self.sanitizer = sanitizer or PromptSanitizer()
         self.risk_scorer = risk_scorer or PromptRiskScorer()
         self.semantic_threshold = semantic_threshold
+        # If set, from configs/secure_balanced.yaml modules.prompt_guard.adaptive_thresholds
+        self.adaptive_tier_thresholds = adaptive_tier_thresholds
+        self.adaptive_len_breakpoints = adaptive_len_breakpoints
 
     def run(self, prompt: str) -> PipelineResult:
         """Run the full pipeline on a single prompt.
@@ -138,8 +143,30 @@ class PromptGuardPipeline:
         normalized = norm_report["normalized"]
         stages.append("normalize")
 
-        # --- Stage 3: Semantic evaluation ---
+        # --- Stage 3: Semantic evaluation (adaptive threshold) ---
+        prompt_len = len(normalized)
+        if self.adaptive_tier_thresholds is not None:
+            short_t, medium_t, long_t = self.adaptive_tier_thresholds
+            bp0, bp1 = self.adaptive_len_breakpoints
+            if prompt_len < bp0:
+                adaptive_threshold = short_t
+            elif prompt_len < bp1:
+                adaptive_threshold = medium_t
+            else:
+                adaptive_threshold = long_t
+        else:
+            if prompt_len < 50:
+                adaptive_threshold = 0.55
+            elif prompt_len < 200:
+                adaptive_threshold = 0.60
+            else:
+                adaptive_threshold = self.semantic_threshold
+
+        # Apply adaptive threshold for this evaluation
+        original_threshold = self.evaluator.threshold
+        self.evaluator.threshold = adaptive_threshold
         semantic_result = self.evaluator.evaluate(normalized)
+        self.evaluator.threshold = original_threshold
         stages.append("semantic_eval")
 
         # --- Stage 4: Pattern detection ---
@@ -147,8 +174,15 @@ class PromptGuardPipeline:
         stages.append("pattern_detect")
 
         # --- Stage 5: Determine if injection ---
+        # If pattern detector found a match, lower the bar for semantic
+        # confirmation (combined signal is stronger)
+        semantic_suspicious = semantic_result.is_suspicious
+        if not semantic_suspicious and pattern_result.is_detected:
+            boosted_threshold = adaptive_threshold - 0.05
+            semantic_suspicious = semantic_result.semantic_score >= boosted_threshold
+
         is_injection = (
-            semantic_result.is_suspicious or pattern_result.is_detected
+            semantic_suspicious or pattern_result.is_detected
         )
 
         # --- Stage 6: Sanitization (only if injection detected) ---

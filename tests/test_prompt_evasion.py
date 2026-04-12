@@ -246,7 +246,12 @@ def run_prompt_evasion_tests() -> Dict:
         for r in results:
             row = {k: v for k, v in r.items() if k in fieldnames}
             writer.writerow(row)
+    # Also save as prompt_leetspeak_metrics.csv (legacy alias used by some reports)
+    import shutil
+    alias_path = _RUNS_DIR / "prompt_leetspeak_metrics.csv"
+    shutil.copy2(csv_path, alias_path)
     print(f"\n  [Saved] {csv_path}")
+    print(f"  [Saved] {alias_path} (alias)")
 
     summary = {
         "total_variants": total,

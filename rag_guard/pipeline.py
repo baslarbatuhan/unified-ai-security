@@ -41,7 +41,6 @@ try:
         RetrievalRiskResult,
         DocScore,
         detection_result_to_doc_scores,
-        _decide,
     )
     from rag_guard.context_filter import ContextFilter, SanitizationResult
 except ImportError:
@@ -52,7 +51,6 @@ except ImportError:
         RetrievalRiskResult,
         DocScore,
         detection_result_to_doc_scores,
-        _decide,
     )
     from context_filter import ContextFilter, SanitizationResult
 
@@ -276,6 +274,24 @@ class RAGGuardPipeline:
         # --- Stage 4: Risk scoring ---
         risk_result = self.risk_scorer.score(doc_scores_for_risk)
 
+        # --- Stage 4b: Judge signal amplification ---
+        # When the LLM judge flags a document strongly, ensure the overall
+        # risk score is not diluted by clean documents in a multi-doc set.
+        if judge_available:
+            max_judge = max((ds.judge_score for ds in combined_scores), default=0.0)
+            if max_judge >= 0.50:
+                floor = round(max_judge, 4)
+            elif max_judge >= 0.20:
+                floor = round(max_judge * 0.80, 4)
+            else:
+                floor = 0.0
+            if floor > 0.0 and risk_result.risk_score < floor:
+                risk_result.evidence.append(
+                    f"Judge amplification: floor={floor:.4f} (max_judge={max_judge:.4f})"
+                )
+                risk_result.risk_score = floor
+                risk_result.decision = self.risk_scorer.decide(risk_result.risk_score)
+
         # Add judge info to evidence
         if judge_available:
             risk_result.evidence.append(f"LLM judge used: {model_used}")
@@ -285,8 +301,11 @@ class RAGGuardPipeline:
         else:
             risk_result.evidence.append("LLM judge unavailable — embedding-only scoring")
 
-        # --- Stage 5: Context filtering ---
-        sanitization = self.context_filter.sanitize(documents)
+        # --- Stage 5: Context filtering (same hybrid scores as risk — no second detect())
+        combined_for_filter = [ds.combined_score for ds in combined_scores]
+        sanitization = self.context_filter.sanitize_with_combined_scores(
+            documents, combined_for_filter
+        )
 
         if sanitization.insufficient_clean_docs:
             pol = sanitization.context_policy
@@ -294,7 +313,7 @@ class RAGGuardPipeline:
                 risk_result.risk_score = max(risk_result.risk_score, 0.88)
             elif pol == "sanitize":
                 risk_result.risk_score = max(risk_result.risk_score, 0.50)
-            risk_result.decision = _decide(risk_result.risk_score)
+            risk_result.decision = self.risk_scorer.decide(risk_result.risk_score)
             risk_result.evidence.append(
                 f"Context policy: insufficient clean docs "
                 f"({sanitization.safe_clean_count}) → {pol}"

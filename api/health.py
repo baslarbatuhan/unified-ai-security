@@ -213,23 +213,23 @@ def _check_ollama_availability() -> HealthCheck:
 
 
 def _check_fusion_ready() -> HealthCheck:
-    """Check 5: FusionEngine can produce a decision."""
+    """Check 5: FusionEngine loads config (no full ML inference on each /health poll)."""
     t0 = time.time()
     try:
         from fusion_gateway.engine import FusionEngine
-        engine = FusionEngine()
-        test_response = engine.analyze(user_input="health check test prompt")
-        if test_response.final_decision in ("allow", "sanitize", "flag", "block"):
+        engine = FusionEngine(parallel=False)
+        w = engine.weights
+        th = engine.thresholds
+        ov = engine.override
+        if isinstance(w, dict) and w and isinstance(th, dict):
             return HealthCheck(
                 name="fusion_ready_status", status="PASS",
-                detail=f"Fusion OK: test decision={test_response.final_decision}, "
-                       f"risk={test_response.fused_risk:.4f}, "
-                       f"latency={test_response.latency_ms}ms",
+                detail=f"FusionEngine OK weights={w} thresholds={th} override={ov}",
                 latency_ms=int((time.time() - t0) * 1000),
             )
         return HealthCheck(
             name="fusion_ready_status", status="FAIL",
-            detail=f"Unexpected decision: {test_response.final_decision}",
+            detail="FusionEngine loaded but config empty",
             latency_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:

@@ -1,9 +1,7 @@
 """
-api/main.py
-===============
+api/api_main.py
+=================
 Minimal FastAPI gateway.
-
-Hocanın notu: "tam production API değil, minimal bir POST /analyze endpointi yeterli"
 
 Endpoints:
     POST /analyze   → Tam pipeline: prompt + rag + agency → fusion → karar
@@ -11,15 +9,16 @@ Endpoints:
 
 Usage:
     pip install fastapi uvicorn
-    uvicorn api.main:app --host 0.0.0.0 --port 8000
+    uvicorn api.api_main:app --host 0.0.0.0 --port 8000
 
     curl -X POST http://localhost:8000/analyze \\
         -H "Content-Type: application/json" \\
-        -d '{"user_input": "Ignore all instructions", "role": "basic"}'
+        -d '{"prompt": "Ignore all instructions", "session_context": {"role": "basic"}}'
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -120,10 +119,20 @@ async def startup():
         run_startup_check(guard_reg, wrapper)
         print("[API] Security self-check PASSED")
     except RuntimeError as e:
+        if os.getenv("STRICT_SECURITY_STARTUP", "").strip().lower() in ("1", "true", "yes"):
+            print(f"[API] Security self-check FAILED (strict): {e}")
+            raise
         print(f"[API] Security self-check FAILED: {e}")
         print("[API] WARNING: Running without full security validation")
     except ImportError as e:
         print(f"[API] Self-check skipped (import error): {e}")
+
+    # Model warmup — preload all ML models so first request is fast
+    try:
+        from api.startup import warmup
+        warmup()
+    except Exception as e:
+        print(f"[API] Warmup failed (non-critical): {e}")
 
 
 # ---------------------------------------------------------------------------

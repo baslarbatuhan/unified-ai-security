@@ -7,6 +7,8 @@ llm:
   model: qwen2.5:7b
   fallback_model: llama3.1:8b
 
+# Used by rag_guard/rag_baseline.py (indexing experiments). Gateway RAG detection uses
+# PoisonDetector embeddings + LLM judge — not Chroma retrieval in the hot path.
 vector_db:
   type: chromadb
 
@@ -24,8 +26,10 @@ policy:
     # Max-rule override: prevents fusion dilution when a single module
     # flags a critical threat.
     override:
-      critical_threshold: 0.85   # module >= this → fused = max(fused, score*0.90)
-      elevated_threshold: 0.60   # module >= this → fused = max(fused, score*0.75)
+      critical_threshold: 0.85
+      critical_multiplier: 0.90
+      elevated_threshold: 0.60
+      elevated_multiplier: 0.85
 
 modules:
   output_agency:
@@ -33,13 +37,20 @@ modules:
   prompt_guard:
     enabled: true
     semantic_threshold: 0.65
+    semantic_threshold_mode: adaptive
+    adaptive_thresholds:
+      short: 0.55    # prompt < short_max_chars
+      medium: 0.60   # prompt < medium_max_chars
+      long: 0.65     # longer prompts
+      short_max_chars: 50
+      medium_max_chars: 200
   rag_guard:
     enabled: true
-    poison_threshold: 0.55
+    poison_threshold: 0.45
     llm_judge:
-      embedding_weight: 0.4
-      judge_weight: 0.6
+      embedding_weight: 0.3
+      judge_weight: 0.7
     context_filter:
-      removal_threshold: 0.55
-      low_confidence_threshold: 0.35
+      removal_threshold: 0.45
+      low_confidence_threshold: 0.30
       min_safe_docs: 2

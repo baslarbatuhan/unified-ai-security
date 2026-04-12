@@ -33,15 +33,57 @@ from typing import Dict, List, Tuple
 
 
 # ---------------------------------------------------------------------------
+# Zero-width characters to strip
+# ---------------------------------------------------------------------------
+ZERO_WIDTH_CHARS = {
+    "\u200b",  # Zero Width Space
+    "\u200c",  # Zero Width Non-Joiner
+    "\u200d",  # Zero Width Joiner
+    "\u200e",  # Left-to-Right Mark
+    "\u200f",  # Right-to-Left Mark
+    "\u2060",  # Word Joiner
+    "\ufeff",  # Zero Width No-Break Space (BOM)
+    "\u00ad",  # Soft Hyphen
+    "\u034f",  # Combining Grapheme Joiner
+    "\u061c",  # Arabic Letter Mark
+    "\u115f",  # Hangul Choseong Filler
+    "\u1160",  # Hangul Jungseong Filler
+    "\u17b4",  # Khmer Vowel Inherent Aq
+    "\u17b5",  # Khmer Vowel Inherent Aa
+}
+
+
+# ---------------------------------------------------------------------------
+# Unicode homoglyph map (Cyrillic/Greek/Fullwidth → Latin)
+# ---------------------------------------------------------------------------
+HOMOGLYPH_MAP: Dict[str, str] = {
+    # Cyrillic lowercase
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
+    "\u0441": "c", "\u0443": "y", "\u0445": "x", "\u0456": "i",
+    # Cyrillic uppercase
+    "\u0410": "A", "\u0412": "B", "\u0415": "E", "\u041a": "K",
+    "\u041c": "M", "\u041d": "H", "\u041e": "O", "\u0420": "P",
+    "\u0421": "C", "\u0422": "T",
+    # Greek
+    "\u03bf": "o", "\u03b1": "a", "\u03b5": "e",
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u039f": "O",
+    # Fullwidth
+    "\uff41": "a", "\uff42": "b", "\uff49": "i", "\uff4f": "o",
+}
+
+
+# ---------------------------------------------------------------------------
 # Extended leetspeak map
 # ---------------------------------------------------------------------------
 LEET_MAP: Dict[str, str] = {
     # Digits
     "0": "o",
     "1": "i",
+    "2": "z",
     "3": "e",
     "4": "a",
     "5": "s",
+    "6": "b",
     "7": "t",
     "8": "b",
     "9": "g",
@@ -52,17 +94,28 @@ LEET_MAP: Dict[str, str] = {
     "(": "c",
     "+": "t",
     "|": "l",
+    "#": "h",
+    "^": "a",
+    "<": "c",
+    "{": "c",
+    "~": "n",
 }
 
 # Multi-char leetspeak sequences (order matters: longer first)
 MULTI_LEET: List[Tuple[str, str]] = [
-    ("ph", "f"),
-    ("vv", "w"),
+    # Longer patterns first to avoid partial matches
+    ("|_|", "u"),
+    ("|-|", "h"),
+    ("}{", "h"),
     ("|<", "k"),
     ("|)", "d"),
-    ("|-|", "h"),
+    ("|=", "f"),
+    ("||", "n"),
     ("/\\", "a"),
     ("\\/", "v"),
+    ("ph", "f"),
+    ("vv", "w"),
+    ("[]", "d"),
 ]
 
 # Unicode digit variants → ASCII digit (then goes through LEET_MAP)
@@ -110,6 +163,16 @@ def _squeeze_repeats(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Core deobfuscation
 # ---------------------------------------------------------------------------
+def _strip_zero_width(text: str) -> str:
+    """Remove all zero-width and invisible Unicode characters."""
+    return "".join(ch for ch in text if ch not in ZERO_WIDTH_CHARS)
+
+
+def _normalize_homoglyphs(text: str) -> str:
+    """Replace Unicode homoglyphs with their ASCII equivalents."""
+    return "".join(HOMOGLYPH_MAP.get(ch, ch) for ch in text)
+
+
 def _replace_unicode_digits(text: str) -> str:
     """Replace Unicode digit variants with ASCII digits."""
     return "".join(UNICODE_DIGIT_MAP.get(ch, ch) for ch in text)
@@ -164,14 +227,18 @@ def deobfuscate(text: str) -> str:
     """Apply all deobfuscation steps to a text string.
 
     Order:
-    1. Replace Unicode digit variants → ASCII digits
-    2. Multi-char leetspeak sequences
-    3. Single-char leetspeak (context-aware)
-    4. Squeeze repeated characters
+    1. Strip zero-width / invisible characters
+    2. Replace Unicode homoglyphs → ASCII
+    3. Replace Unicode digit variants → ASCII digits
+    4. Multi-char leetspeak sequences
+    5. Single-char leetspeak (context-aware)
+    6. Squeeze repeated characters
 
     Returns:
         Deobfuscated text.
     """
+    text = _strip_zero_width(text)
+    text = _normalize_homoglyphs(text)
     text = _replace_unicode_digits(text)
     text = _decode_multi_leet(text)
     text = _decode_leetspeak(text)
@@ -183,13 +250,20 @@ def get_deobfuscation_report(text: str) -> Dict:
     """Run deobfuscation and report what changed."""
     original = text
 
-    after_unicode = _replace_unicode_digits(text)
+    after_zw = _strip_zero_width(text)
+    after_homo = _normalize_homoglyphs(after_zw)
+    after_unicode = _replace_unicode_digits(after_homo)
     after_multi = _decode_multi_leet(after_unicode)
     after_leet = _decode_leetspeak(after_multi)
     final = _squeeze_repeats(after_leet)
 
     changes = []
-    if after_unicode != text:
+    if after_zw != text:
+        removed = len(text) - len(after_zw)
+        changes.append(f"Stripped {removed} zero-width characters")
+    if after_homo != after_zw:
+        changes.append("Replaced Unicode homoglyphs")
+    if after_unicode != after_homo:
         changes.append("Replaced Unicode digit variants")
     if after_multi != after_unicode:
         changes.append("Decoded multi-char leetspeak sequences")

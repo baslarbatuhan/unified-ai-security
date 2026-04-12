@@ -69,16 +69,25 @@ def _load_yaml_config() -> dict:
         return {}
 
 
+_FALLBACK_OVERRIDE = {
+    "critical_threshold": 0.85,
+    "critical_multiplier": 0.90,
+    "elevated_threshold": 0.60,
+    "elevated_multiplier": 0.85,
+}
+
+
 def _resolve_config():
-    """Resolve weights and thresholds from YAML config with fallback."""
+    """Resolve weights, thresholds, and override from YAML config with fallback."""
     cfg = _load_yaml_config()
     fusion_cfg = cfg.get("policy", {}).get("fusion", {})
     weights = fusion_cfg.get("weights", _FALLBACK_WEIGHTS)
     thresholds = fusion_cfg.get("thresholds", _FALLBACK_THRESHOLDS)
-    return weights, thresholds
+    override = fusion_cfg.get("override", _FALLBACK_OVERRIDE)
+    return weights, thresholds, override
 
 
-DEFAULT_WEIGHTS, DEFAULT_THRESHOLDS = _resolve_config()
+DEFAULT_WEIGHTS, DEFAULT_THRESHOLDS, DEFAULT_OVERRIDE = _resolve_config()
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +105,8 @@ class ModuleRisk:
 
 
 @dataclass
-class AnalyzeRequest:
-    """Incoming request to the gateway."""
+class FusionEngineRequest:
+    """Incoming request to the fusion engine (internal; API uses schemas.risk_schema)."""
     user_input: str = ""
     retrieved_context: Optional[str] = None
     tool_call: Optional[Dict[str, Any]] = None
@@ -106,8 +115,8 @@ class AnalyzeRequest:
 
 
 @dataclass
-class AnalyzeResponse:
-    """Gateway response with fused risk."""
+class FusionEngineResponse:
+    """Fusion engine output with fused risk."""
     final_decision: Decision = "allow"
     fused_risk: float = 0.0
     module_risks: List[Dict] = field(default_factory=list)
@@ -120,6 +129,11 @@ class AnalyzeResponse:
             "module_risks": self.module_risks,
             "latency_ms": self.latency_ms,
         }
+
+
+# Deprecated aliases — prefer FusionEngineRequest / FusionEngineResponse vs schemas.risk_schema
+AnalyzeRequest = FusionEngineRequest
+AnalyzeResponse = FusionEngineResponse
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +152,86 @@ def _get_prompt_pipeline():
     global _prompt_pipeline
     if _prompt_pipeline is None:
         from prompt_guard.pipeline import PromptGuardPipeline
-        _prompt_pipeline = PromptGuardPipeline()
+        cfg = _load_yaml_config()
+        pg_cfg = (cfg.get("modules") or {}).get("prompt_guard") or {}
+        semantic_threshold = float(pg_cfg.get("semantic_threshold", 0.65))
+        mode = str(pg_cfg.get("semantic_threshold_mode", "adaptive")).lower()
+        ad = pg_cfg.get("adaptive_thresholds") or {}
+        if mode == "adaptive" and ad:
+            short_t = float(ad.get("short", 0.55))
+            medium_t = float(ad.get("medium", 0.60))
+            long_t = float(ad.get("long", semantic_threshold))
+            short_max = int(ad.get("short_max_chars", 50))
+            medium_max = int(ad.get("medium_max_chars", 200))
+            _prompt_pipeline = PromptGuardPipeline(
+                semantic_threshold=semantic_threshold,
+                adaptive_tier_thresholds=(short_t, medium_t, long_t),
+                adaptive_len_breakpoints=(short_max, medium_max),
+            )
+        else:
+            _prompt_pipeline = PromptGuardPipeline(semantic_threshold=semantic_threshold)
     return _prompt_pipeline
+
+
+def _module_enabled_flags() -> Dict[str, bool]:
+    """Respect modules.<name>.enabled in secure_balanced.yaml (default: all True)."""
+    cfg = _load_yaml_config()
+    mods = cfg.get("modules") or {}
+    return {
+        "prompt_guard": bool(mods.get("prompt_guard", {}).get("enabled", True)),
+        "rag_guard": bool(mods.get("rag_guard", {}).get("enabled", True)),
+        "output_agency": bool(mods.get("output_agency", {}).get("enabled", True)),
+    }
+
+
+def _disabled_module_risk(module: str) -> ModuleRisk:
+    return ModuleRisk(
+        module=module,
+        risk_score=0.0,
+        confidence=1.0,
+        decision="allow",
+        evidence=[f"{module} disabled (modules.{module}.enabled=false in configs/secure_balanced.yaml)"],
+        latency_ms=0,
+    )
+
+
+def _max_agency_risk(
+    tool_call: Optional[Dict],
+    tool_candidates: Optional[List[Dict[str, Any]]],
+    user_id: str,
+    role: str,
+) -> ModuleRisk:
+    """Single tool_call or max risk across multiple candidates (conservative)."""
+    if tool_candidates:
+        risks = [_evaluate_agency_guard(tc, user_id, role) for tc in tool_candidates]
+        if not risks:
+            return _evaluate_agency_guard(None, user_id, role)
+        best = max(risks, key=lambda r: r.risk_score)
+        if len(risks) > 1:
+            ev = [f"Max agency risk over {len(risks)} tool candidate(s)"] + list(best.evidence)
+            return ModuleRisk(
+                module=best.module,
+                risk_score=best.risk_score,
+                confidence=best.confidence,
+                decision=best.decision,
+                evidence=ev,
+                latency_ms=best.latency_ms,
+            )
+        return best
+    return _evaluate_agency_guard(tool_call, user_id, role)
 
 
 def _build_rag_pipeline_from_yaml() -> Any:
     """Construct RAGGuardPipeline using modules.rag_guard + llm sections from secure_balanced.yaml."""
     from rag_guard.pipeline import RAGGuardPipeline
     from rag_guard.llm_judge import LLMJudge
+    from rag_guard.retrieval_risk_score import RetrievalRiskScorer
+
+    try:
+        from configs.policy_thresholds import load_fusion_thresholds
+        fusion_th = load_fusion_thresholds()
+    except Exception:
+        fusion_th = None
 
     cfg = _load_yaml_config()
     rag = (cfg.get("modules") or {}).get("rag_guard") or {}
@@ -164,6 +250,11 @@ def _build_rag_pipeline_from_yaml() -> Any:
     fallback = str(llm.get("fallback_model", "llama3.1:8b"))
     judge = LLMJudge(model=model, fallback_model=fallback)
 
+    rsc = RetrievalRiskScorer(
+        poison_threshold=poison_th,
+        decision_thresholds=fusion_th,
+    )
+
     return RAGGuardPipeline(
         judge=judge,
         embedding_weight=emb_w,
@@ -172,6 +263,7 @@ def _build_rag_pipeline_from_yaml() -> Any:
         removal_threshold=removal,
         low_confidence_threshold=low_c,
         min_safe_docs=min_safe,
+        risk_scorer=rsc,
     )
 
 
@@ -328,7 +420,7 @@ def _evaluate_agency_guard(
         # Param validation
         param_result = param_validator.validate(tool_name, args)
         if not param_result.is_valid:
-            risk_score = max(risk_score, 0.70)
+            risk_score = max(risk_score, 0.85)
             evidence.extend(param_result.violations)
 
         # Enum check
@@ -400,11 +492,13 @@ class FusionEngine:
         self,
         weights: Optional[Dict[str, float]] = None,
         thresholds: Optional[Dict[str, float]] = None,
+        override: Optional[Dict[str, float]] = None,
         parallel: bool = True,
         max_workers: int = 3,
     ):
         self.weights = weights or DEFAULT_WEIGHTS
         self.thresholds = thresholds or DEFAULT_THRESHOLDS
+        self.override = override or DEFAULT_OVERRIDE
         self.parallel = parallel
         self.max_workers = max_workers
 
@@ -416,7 +510,8 @@ class FusionEngine:
         tool_call: Optional[Dict] = None,
         role: str = "basic",
         user_id: str = "anonymous",
-    ) -> AnalyzeResponse:
+        tool_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> FusionEngineResponse:
         """
         Run all 3 modules and fuse risk scores.
 
@@ -425,45 +520,68 @@ class FusionEngine:
             retrieved_context: RAG retrieval context as single string (legacy)
             retrieved_docs:    RAG retrieved documents as list of dicts (preferred)
             tool_call:         Tool call dict with 'tool' and 'args' (if any)
+            tool_candidates:   If set, agency uses max risk over these (overrides single tool_call)
             role:              User role
             user_id:           User identifier
 
         Returns:
-            AnalyzeResponse with fused decision.
+            FusionEngineResponse with fused decision.
         """
         t0 = time.time()
+        enabled = _module_enabled_flags()
 
         # Run modules (parallel or sequential)
         if self.parallel:
             prompt_risk, rag_risk, agency_risk = self._run_parallel(
                 user_input, retrieved_context, retrieved_docs,
-                tool_call, user_id, role
+                tool_call, user_id, role, enabled, tool_candidates,
             )
         else:
-            prompt_risk = _evaluate_prompt_guard(user_input)
-            rag_risk = _evaluate_rag_guard(
-                retrieved_docs=retrieved_docs,
-                retrieved_context=retrieved_context,
-                user_query=user_input,
+            prompt_risk = (
+                _evaluate_prompt_guard(user_input)
+                if enabled.get("prompt_guard", True) else _disabled_module_risk("prompt_guard")
             )
-            agency_risk = _evaluate_agency_guard(tool_call, user_id, role)
+            rag_risk = (
+                _evaluate_rag_guard(
+                    retrieved_docs=retrieved_docs,
+                    retrieved_context=retrieved_context,
+                    user_query=user_input,
+                )
+                if enabled.get("rag_guard", True) else _disabled_module_risk("rag_guard")
+            )
+            agency_risk = (
+                _max_agency_risk(tool_call, tool_candidates, user_id, role)
+                if enabled.get("output_agency", True) else _disabled_module_risk("output_agency")
+            )
 
-        # Weighted sum
-        fused = (
-            self.weights["prompt_guard"] * prompt_risk.risk_score
-            + self.weights["rag_guard"] * rag_risk.risk_score
-            + self.weights["output_agency"] * agency_risk.risk_score
-        )
-        fused = round(min(fused, 1.0), 4)
+        # Weighted sum — renormalize over enabled modules only
+        keys = ("prompt_guard", "rag_guard", "output_agency")
+        risks = {
+            "prompt_guard": prompt_risk,
+            "rag_guard": rag_risk,
+            "output_agency": agency_risk,
+        }
+        num = 0.0
+        den = 0.0
+        for k in keys:
+            if enabled.get(k, True):
+                num += self.weights[k] * risks[k].risk_score
+                den += self.weights[k]
+        fused = round(min(num / den, 1.0), 4) if den > 0 else 0.0
 
         # Max-rule override: if any module flags a critical threat,
         # the fused score must reflect at least that module's severity.
         # This prevents dilution when only one module detects an attack.
+        crit_th = self.override.get("critical_threshold", 0.85)
+        crit_mul = self.override.get("critical_multiplier", 0.90)
+        elev_th = self.override.get("elevated_threshold", 0.60)
+        elev_mul = self.override.get("elevated_multiplier", 0.85)
+
         module_max = max(prompt_risk.risk_score, rag_risk.risk_score, agency_risk.risk_score)
-        if module_max >= 0.85:
-            fused = max(fused, module_max * 0.90)
-        elif module_max >= 0.60:
-            fused = max(fused, module_max * 0.75)
+        if module_max >= crit_th:
+            fused = max(fused, module_max * crit_mul)
+        elif module_max >= elev_th:
+            fused = max(fused, module_max * elev_mul)
 
         fused = round(min(fused, 1.0), 4)
 
@@ -471,7 +589,7 @@ class FusionEngine:
 
         total_latency = int((time.time() - t0) * 1000)
 
-        return AnalyzeResponse(
+        return FusionEngineResponse(
             final_decision=final_decision,
             fused_risk=fused,
             module_risks=[
@@ -496,20 +614,32 @@ class FusionEngine:
         tool_call: Optional[Dict],
         user_id: str,
         role: str,
+        enabled: Dict[str, bool],
+        tool_candidates: Optional[List[Dict[str, Any]]] = None,
         timeout: int = 60,
     ) -> tuple:
-        """Run all 3 modules in parallel using ThreadPoolExecutor."""
+        """Run enabled modules in parallel using ThreadPoolExecutor."""
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_prompt = executor.submit(_evaluate_prompt_guard, user_input)
-            future_rag = executor.submit(
-                _evaluate_rag_guard,
-                retrieved_docs=retrieved_docs,
-                retrieved_context=retrieved_context,
-                user_query=user_input,
-            )
-            future_agency = executor.submit(_evaluate_agency_guard, tool_call, user_id, role)
+            future_prompt = None
+            future_rag = None
+            future_agency = None
+            if enabled.get("prompt_guard", True):
+                future_prompt = executor.submit(_evaluate_prompt_guard, user_input)
+            if enabled.get("rag_guard", True):
+                future_rag = executor.submit(
+                    _evaluate_rag_guard,
+                    retrieved_docs=retrieved_docs,
+                    retrieved_context=retrieved_context,
+                    user_query=user_input,
+                )
+            if enabled.get("output_agency", True):
+                future_agency = executor.submit(
+                    _max_agency_risk, tool_call, tool_candidates, user_id, role,
+                )
 
-            def _safe_result(future, module_name: str) -> ModuleRisk:
+            def _safe_result(future, module_name: str, disabled: ModuleRisk) -> ModuleRisk:
+                if future is None:
+                    return disabled
                 try:
                     return future.result(timeout=timeout)
                 except Exception as e:
@@ -518,23 +648,23 @@ class FusionEngine:
                         decision="allow", evidence=[f"Timeout/error: {e}"],
                     )
 
-            prompt_risk = _safe_result(future_prompt, "prompt_guard")
-            rag_risk = _safe_result(future_rag, "rag_guard")
-            agency_risk = _safe_result(future_agency, "output_agency")
+            prompt_risk = _safe_result(future_prompt, "prompt_guard", _disabled_module_risk("prompt_guard"))
+            rag_risk = _safe_result(future_rag, "rag_guard", _disabled_module_risk("rag_guard"))
+            agency_risk = _safe_result(future_agency, "output_agency", _disabled_module_risk("output_agency"))
 
         return prompt_risk, rag_risk, agency_risk
 
-    def analyze_prompt_only(self, user_input: str) -> AnalyzeResponse:
+    def analyze_prompt_only(self, user_input: str) -> FusionEngineResponse:
         """Shortcut: evaluate only prompt guard."""
         return self.analyze(user_input=user_input)
 
-    def analyze_with_context(self, user_input: str, context: str) -> AnalyzeResponse:
+    def analyze_with_context(self, user_input: str, context: str) -> FusionEngineResponse:
         """Shortcut: evaluate prompt + RAG guard (legacy string)."""
         return self.analyze(user_input=user_input, retrieved_context=context)
 
     def analyze_with_docs(
         self, user_input: str, docs: List[Dict[str, Any]]
-    ) -> AnalyzeResponse:
+    ) -> FusionEngineResponse:
         """Shortcut: evaluate prompt + RAG guard (structured docs)."""
         return self.analyze(user_input=user_input, retrieved_docs=docs)
 

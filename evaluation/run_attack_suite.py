@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -68,7 +69,12 @@ def build_prompt_attacks() -> List[Dict]:
 
 
 def build_rag_attacks() -> List[Dict]:
-    """Load RAG poisoning dataset."""
+    """Load RAG poisoning dataset.
+
+    Each poisoned doc is sent alongside 3-4 clean docs to simulate
+    a realistic top-k RAG retrieval (real-world RAG never returns a
+    single document).
+    """
     json_path = _PROJECT_ROOT / "datasets" / "poisoned_corpus" / "advanced_poison_samples.json"
     if not json_path.exists():
         print(f"  [SKIP] {json_path} not found")
@@ -77,18 +83,29 @@ def build_rag_attacks() -> List[Dict]:
     with open(json_path, "r", encoding="utf-8") as f:
         dataset = json.load(f)
 
+    # Collect clean docs to use as padding
+    clean_docs = [
+        {"doc_id": doc["doc_id"], "content": doc["content"]}
+        for doc in dataset["documents"]
+        if not doc.get("is_poisoned")
+    ]
+
     attacks = []
     for doc in dataset["documents"]:
         if doc.get("is_poisoned"):
+            # Build realistic top-k: poisoned doc at random rank among 5 docs
+            padding = random.sample(clean_docs, min(4, len(clean_docs)))
+            retrieved = [{"doc_id": doc["doc_id"], "content": doc["content"]}]
+            retrieved.extend(padding)
+            random.shuffle(retrieved)
+
             attacks.append({
                 "attack_id": doc["doc_id"],
                 "attack_type": f"rag_{doc.get('poison_technique', 'unknown')}",
                 "module_targeted": "rag_guard",
                 "request": {
                     "prompt": doc.get("target_query", "What is the policy?"),
-                    "retrieved_docs": [
-                        {"doc_id": doc["doc_id"], "content": doc["content"]},
-                    ],
+                    "retrieved_docs": retrieved,
                     "session_context": {"user_id": "user_test", "role": "basic"},
                 },
                 "dataset_source": "advanced_poison_samples.json",
@@ -189,6 +206,23 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
         0.30 * prompt_score + 0.30 * rag_score + 0.40 * agency_score + 0.01
     ) else "no"
 
+    # Extract per-module latency from module_risks
+    prompt_latency = 0
+    rag_latency = 0
+    agency_latency = 0
+    for m in response.get("module_risks", []):
+        mod = m.get("module", "")
+        lat = m.get("latency_ms", 0) or 0
+        if mod == "prompt_guard":
+            prompt_latency = lat
+        elif mod == "rag_guard":
+            rag_latency = lat
+        elif mod == "output_agency":
+            agency_latency = lat
+
+    total_latency = response.get("latency_ms", 0)
+    fusion_latency = max(0, total_latency - max(prompt_latency, rag_latency, agency_latency))
+
     return {
         "attack_id": attack["attack_id"],
         "attack_type": attack["attack_type"],
@@ -199,7 +233,11 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
         "fused_risk_score": round(fused, 4),
         "override_triggered": override_triggered,
         "decision": response.get("decision", response.get("final_decision", "error")),
-        "latency_ms": response.get("latency_ms", 0),
+        "latency_ms": total_latency,
+        "prompt_latency_ms": prompt_latency,
+        "rag_latency_ms": rag_latency,
+        "agency_latency_ms": agency_latency,
+        "fusion_latency_ms": fusion_latency,
         "dataset_source": attack["dataset_source"],
     }
 
@@ -207,12 +245,16 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
 # ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
-def run_attack_suite(base_url: str = "http://localhost:8000") -> Dict:
+def run_attack_suite(base_url: str = "http://localhost:8000", seed: int = 42) -> Dict:
     """Run all attack datasets through the HTTP gateway."""
+
+    # Set seed for reproducibility
+    random.seed(seed)
 
     print(f"\n{'='*65}")
     print(f"  ATTACK SUITE RUNNER (HTTP)")
     print(f"  Gateway: {base_url}")
+    print(f"  Seed: {seed}")
     print(f"{'='*65}")
 
     # Build all attacks
@@ -292,7 +334,8 @@ def run_attack_suite(base_url: str = "http://localhost:8000") -> Dict:
         "attack_id", "attack_type", "module_targeted",
         "module_prompt_score", "module_rag_score", "module_agency_score",
         "fused_risk_score", "override_triggered", "decision",
-        "latency_ms", "dataset_source",
+        "latency_ms", "prompt_latency_ms", "rag_latency_ms",
+        "agency_latency_ms", "fusion_latency_ms", "dataset_source",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -321,6 +364,7 @@ def run_attack_suite(base_url: str = "http://localhost:8000") -> Dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run attack suite through HTTP gateway")
     parser.add_argument("--url", default="http://localhost:8000", help="Gateway URL")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
 
-    run_attack_suite(base_url=args.url)
+    run_attack_suite(base_url=args.url, seed=args.seed)
