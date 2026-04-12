@@ -195,42 +195,35 @@ def normalize_whitespace(text: str) -> str:
 # ---------------------------------------------------------------------------
 def normalize_prompt(prompt: str) -> str:
     """
-    Apply all normalization steps to a prompt before detection.
+    Apply normalization steps complementary to deobfuscator.
 
-    Order matters:
-    1. Strip zero-width chars (invisible manipulation)
-    2. Replace homoglyphs (visual spoofing)
-    3. NFKC normalize (decompose special forms)
-    4. Detect encoded payloads (base64, ROT13) — before leetspeak!
-    5. Decode leetspeak (character substitution)
-    6. Remove character separation (dot/hyphen splitting)
-    7. Normalize whitespace
+    The deobfuscator (runs before this) already handles:
+        - Zero-width character stripping
+        - Homoglyph replacement
+        - Leetspeak decoding
+
+    This normalizer handles what remains:
+    1. NFKC normalize (decompose special Unicode forms)
+    2. Detect encoded payloads (base64, ROT13)
+    3. Remove character separation (dot/hyphen splitting)
+    4. Normalize whitespace
 
     Returns:
         Normalized prompt string ready for semantic + pattern detection.
     """
     text = prompt
 
-    # Step 1: Strip invisible characters
-    text = strip_zero_width(text)
-
-    # Step 2: Replace homoglyphs
-    text = replace_homoglyphs(text)
-
-    # Step 3: Unicode normalization
+    # Step 1: Unicode normalization
     text = normalize_unicode(text)
 
-    # Step 4: Encoding detection FIRST (before leetspeak mangles ROT13/base64)
+    # Step 2: Encoding detection
     text, _ = detect_and_flag_base64(text)
     text, _ = detect_and_flag_rot13(text)
 
-    # Step 5: Leetspeak
-    text = decode_leetspeak(text)
-
-    # Step 6: Character separation
+    # Step 3: Character separation
     text = remove_character_separation(text)
 
-    # Step 7: Whitespace
+    # Step 4: Whitespace
     text = normalize_whitespace(text)
 
     return text
@@ -239,23 +232,14 @@ def normalize_prompt(prompt: str) -> str:
 def get_normalization_report(prompt: str) -> Dict:
     """
     Run normalization and report what was changed.
-    Useful for debugging and audit logging.
+    Complementary to deobfuscator (zero-width, homoglyphs, leetspeak
+    are already handled upstream).
     """
     original = prompt
     changes = []
 
-    # Track each step
-    after_zw = strip_zero_width(prompt)
-    if after_zw != prompt:
-        removed = len(prompt) - len(after_zw)
-        changes.append(f"Stripped {removed} zero-width characters")
-
-    after_homo = replace_homoglyphs(after_zw)
-    if after_homo != after_zw:
-        changes.append("Replaced Unicode homoglyphs")
-
-    after_nfkc = normalize_unicode(after_homo)
-    if after_nfkc != after_homo:
+    after_nfkc = normalize_unicode(prompt)
+    if after_nfkc != prompt:
         changes.append("Applied NFKC normalization")
 
     after_b64, has_b64 = detect_and_flag_base64(after_nfkc)
@@ -266,12 +250,8 @@ def get_normalization_report(prompt: str) -> Dict:
     if has_rot:
         changes.append("ROT13 encoding detected and flagged")
 
-    after_leet = decode_leetspeak(after_rot)
-    if after_leet != after_rot:
-        changes.append("Decoded leetspeak characters")
-
-    after_sep = remove_character_separation(after_leet)
-    if after_sep != after_leet:
+    after_sep = remove_character_separation(after_rot)
+    if after_sep != after_rot:
         changes.append("Removed character separation")
 
     final = normalize_whitespace(after_sep)

@@ -22,7 +22,7 @@ A unified AI security system that combines defense layers against three major at
    ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
    │   Prompt Guard    │   │    RAG Guard      │   │  Agency Defense   │
    │  (semantic+pattern│   │ (poison+context   │   │ (authz+enum+      │
-   │   +normalisation) │   │  filter+scoring)  │   │  behaviour+param) │
+   │   +normalisation) │   │  filter+scoring)  │   │  param validation)│
    └────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘
             │ ModuleRisk            │ ModuleRisk            │ ModuleRisk
             └───────────────────────┼───────────────────────┘
@@ -39,7 +39,7 @@ A unified AI security system that combines defense layers against three major at
 
 **Fusion Formula:**
 - `fused_risk = Σ(module_risk × weight)` — weighted sum
-- **Max-rule override:** If any module scores ≥ 0.85, the fused risk is at least `module_max × 0.90`; if ≥ 0.60, at least `module_max × 0.75`. This prevents a single high-risk module from being diluted by other modules returning 0.0.
+- **Max-rule override:** If any module scores ≥ 0.85, the fused risk is at least `module_max × 0.90`; if ≥ 0.60, at least `module_max × 0.85` (see `configs/secure_balanced.yaml` `policy.fusion.override`). This reduces dilution when only one module flags a threat.
 
 ---
 
@@ -170,7 +170,7 @@ query → rag_baseline (ChromaDB retrieve) → poison_detector → context_filte
 
 **Pipeline:**
 ```
-tool_call → authz_guard → enum_guard → param_validation → behavior_monitor → risk_scoring → decision
+Gateway `FusionEngine` path: `tool_call` → authz → enum → param_validation → risk (behaviour_monitor is implemented for eval/tests but not wired into this fusion path).
 ```
 
 | Component | File | Description |
@@ -192,7 +192,7 @@ tool_call → authz_guard → enum_guard → param_validation → behavior_monit
 |---------|--------|
 | Weights | `output_agency: 0.40`, `prompt_guard: 0.30`, `rag_guard: 0.30` |
 | Thresholds | `allow < 0.30`, `sanitize 0.30–0.60`, `flag 0.60–0.85`, `block ≥ 0.85` |
-| Max-Rule Override | Single module ≥ 0.85 → fused ≥ `max × 0.90`; ≥ 0.60 → fused ≥ `max × 0.75` |
+| Max-Rule Override | Single module ≥ 0.85 → fused ≥ `max × 0.90`; ≥ 0.60 → fused ≥ `max × 0.85` |
 | Model Singleton | SemanticEvaluator and PoisonDetector are loaded on the first request and reused for subsequent ones (~180ms/request on GPU) |
 
 ---

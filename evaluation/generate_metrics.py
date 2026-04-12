@@ -8,6 +8,7 @@ Outputs:
     runs/pipeline_prompt_metrics.csv    — Prompt guard pipeline results
     runs/pipeline_agency_metrics.csv    — Agency guard results with LLM tool calling
     runs/latency_metrics.csv            — Per-module and fusion latency measurements
+    runs/fusion_updated_metrics.csv     — Aggregated gateway attack summary
 
 Usage:
     python evaluation/generate_metrics.py
@@ -15,6 +16,7 @@ Usage:
     python evaluation/generate_metrics.py --module prompt
     python evaluation/generate_metrics.py --module agency
     python evaluation/generate_metrics.py --module latency
+    python evaluation/generate_metrics.py --module fusion_summary
 """
 
 from __future__ import annotations
@@ -395,11 +397,75 @@ def generate_latency_metrics() -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Fusion Summary — aggregate gateway_attack_results.csv into a summary row
+# ---------------------------------------------------------------------------
+def generate_fusion_summary() -> List[Dict]:
+    """Aggregate gateway_attack_results.csv into fusion_updated_metrics.csv."""
+    from datetime import datetime, timezone
+    import statistics
+
+    source_csv = _RUNS_DIR / "gateway_attack_results.csv"
+    if not source_csv.exists():
+        print(f"  [SKIP] {source_csv} not found — run run_attack_suite.py first")
+        return []
+
+    with open(source_csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    if not rows:
+        print("  [SKIP] gateway_attack_results.csv is empty")
+        return []
+
+    # Count decisions
+    decisions = {}
+    fused_risks = []
+    for r in rows:
+        d = r.get("gateway_decision", r.get("final_decision", "unknown"))
+        decisions[d] = decisions.get(d, 0) + 1
+        try:
+            fused_risks.append(float(r.get("fused_risk", r.get("gateway_fused_risk", 0))))
+        except ValueError:
+            pass
+
+    mean_risk = round(statistics.mean(fused_risks), 5) if fused_risks else 0.0
+    median_risk = round(statistics.median(fused_risks), 5) if fused_risks else 0.0
+
+    summary_row = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_csv": "gateway_attack_results.csv",
+        "total_rows": len(rows),
+        "decision_allow": decisions.get("allow", 0),
+        "decision_sanitize": decisions.get("sanitize", 0),
+        "decision_flag": decisions.get("flag", 0),
+        "decision_block": decisions.get("block", 0),
+        "decision_error": decisions.get("error", 0),
+        "decision_other": sum(v for k, v in decisions.items() if k not in ("allow", "sanitize", "flag", "block", "error")),
+        "mean_fused_risk": mean_risk,
+        "median_fused_risk": median_risk,
+        "summary_json_decisions": json.dumps({k: v for k, v in sorted(decisions.items())}),
+    }
+
+    _RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _RUNS_DIR / "fusion_updated_metrics.csv"
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+        writer.writeheader()
+        writer.writerow(summary_row)
+
+    print(f"  Fusion Summary: {len(rows)} attacks | mean_risk={mean_risk:.4f} median={median_risk:.4f}")
+    print(f"    Decisions: {decisions}")
+    print(f"  [Saved] {out_path}")
+
+    return [summary_row]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Generate per-module metrics CSVs")
-    parser.add_argument("--module", choices=["rag", "prompt", "agency", "latency", "all"],
+    parser.add_argument("--module", choices=["rag", "prompt", "agency", "latency", "fusion_summary", "all"],
                         default="all", help="Which module metrics to generate")
     args = parser.parse_args()
 
@@ -422,6 +488,10 @@ def main():
     if args.module in ("latency", "all"):
         print(f"\n  --- Latency Metrics ---")
         generate_latency_metrics()
+
+    if args.module in ("fusion_summary", "all"):
+        print(f"\n  --- Fusion Summary Metrics ---")
+        generate_fusion_summary()
 
     print(f"\n{'='*65}")
     print(f"  Done.")

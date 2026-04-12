@@ -112,15 +112,50 @@ class ContextFilter:
                 safe_clean_count=0,
             )
 
-        # Run poison detection
         detector_input = [{"doc_id": d.get("doc_id", f"doc_{i}"), "content": d.get("content", "")}
                           for i, d in enumerate(documents)]
         detection = self.detector.detect(detector_input)
+        scores = [ds.poison_score for ds in detection.document_scores]
+        pattern_rows = [ds.pattern_matches for ds in detection.document_scores]
+        return self._sanitize_with_scores(
+            documents, scores, pattern_hints=pattern_rows, score_label="poison_score",
+        )
 
-        # Filter based on scores — three tiers:
-        #   score >= removal_threshold       → removed
-        #   score >= low_confidence_threshold → demoted (kept but downranked)
-        #   score < low_confidence_threshold  → kept as-is
+    def sanitize_with_combined_scores(
+        self,
+        documents: List[Dict],
+        combined_scores: List[float],
+    ) -> SanitizationResult:
+        """Filter using hybrid (embedding + judge) scores from RAGGuardPipeline.
+
+        Avoids a second PoisonDetector.detect() call and aligns filtering with
+        the same scores used for retrieval risk and fusion.
+        """
+        if not documents:
+            return SanitizationResult(
+                original_count=0, kept_count=0, removed_count=0,
+                filtered_context="No documents retrieved.",
+                evidence=["Empty retrieval result"],
+                insufficient_clean_docs=False,
+                context_policy="none",
+                safe_clean_count=0,
+            )
+        if len(combined_scores) != len(documents):
+            raise ValueError(
+                f"combined_scores length {len(combined_scores)} != documents {len(documents)}"
+            )
+        return self._sanitize_with_scores(
+            documents, combined_scores, pattern_hints=None, score_label="combined_score",
+        )
+
+    def _sanitize_with_scores(
+        self,
+        documents: List[Dict],
+        scores: List[float],
+        pattern_hints: Optional[List[List[str]]] = None,
+        score_label: str = "poison_score",
+    ) -> SanitizationResult:
+        """Filter based on precomputed per-document scores (detector or hybrid)."""
         filtered_docs = []
         kept_docs = []       # clean docs (kept as-is)
         demoted_docs = []    # low confidence docs (kept but after clean docs)
@@ -128,42 +163,40 @@ class ContextFilter:
         demoted_count = 0
         evidence = []
 
-        for i, doc_score in enumerate(detection.document_scores):
+        for i, poison_score in enumerate(scores):
             doc = documents[i]
             doc_id = doc.get("doc_id", f"doc_{i}")
             content = doc.get("content", "")
+            patterns = pattern_hints[i] if pattern_hints else []
 
-            if doc_score.poison_score >= self.removal_threshold:
-                # Remove this document
+            if poison_score >= self.removal_threshold:
                 filtered_docs.append(FilteredDoc(
                     doc_id=doc_id, content="[REMOVED: Suspicious content detected]",
-                    is_original=False, poison_score=doc_score.poison_score, action="removed",
+                    is_original=False, poison_score=poison_score, action="removed",
                 ))
                 removed_count += 1
                 evidence.append(
-                    f"Removed '{doc_id}': poison_score={doc_score.poison_score:.3f} "
+                    f"Removed '{doc_id}': {score_label}={poison_score:.3f} "
                     f"(threshold={self.removal_threshold})"
                 )
-                if doc_score.pattern_matches:
-                    evidence.append(f"  Patterns: {', '.join(doc_score.pattern_matches)}")
+                if patterns:
+                    evidence.append(f"  Patterns: {', '.join(patterns)}")
 
-            elif doc_score.poison_score >= self.low_confidence_threshold:
-                # Demote: keep but place after clean docs
+            elif poison_score >= self.low_confidence_threshold:
                 filtered_docs.append(FilteredDoc(
                     doc_id=doc_id, content=content,
-                    is_original=False, poison_score=doc_score.poison_score, action="demoted",
+                    is_original=False, poison_score=poison_score, action="demoted",
                 ))
                 demoted_docs.append(content)
                 demoted_count += 1
                 evidence.append(
-                    f"Demoted '{doc_id}': poison_score={doc_score.poison_score:.3f} "
+                    f"Demoted '{doc_id}': {score_label}={poison_score:.3f} "
                     f"(low confidence zone {self.low_confidence_threshold}-{self.removal_threshold})"
                 )
             else:
-                # Keep this document
                 filtered_docs.append(FilteredDoc(
                     doc_id=doc_id, content=content,
-                    is_original=True, poison_score=doc_score.poison_score, action="kept",
+                    is_original=True, poison_score=poison_score, action="kept",
                 ))
                 kept_docs.append(content)
 
@@ -204,7 +237,12 @@ class ContextFilter:
             )
 
         if removed_count == 0 and demoted_count == 0:
-            evidence.append("No documents removed or demoted. All content passed poison detection.")
+            passed = (
+                "hybrid score threshold checks"
+                if score_label == "combined_score"
+                else "poison detection"
+            )
+            evidence.append(f"No documents removed or demoted. All content passed {passed}.")
 
         return SanitizationResult(
             original_count=original_count,

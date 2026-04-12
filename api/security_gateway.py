@@ -96,6 +96,12 @@ class SecurityGateway:
         if tr:
             tool_call = {"tool": tr.tool, "args": tr.params}
 
+        tool_candidates_dicts = None
+        if request.tool_candidates:
+            tool_candidates_dicts = [
+                {"tool": t.tool, "args": t.params} for t in request.tool_candidates
+            ]
+
         # --- Run FusionEngine ---
         engine_response = self.engine.analyze(
             user_input=prompt,
@@ -104,6 +110,7 @@ class SecurityGateway:
             tool_call=tool_call,
             role=role,
             user_id=user_id,
+            tool_candidates=tool_candidates_dicts,
         )
 
         # --- Map to new AnalyzeResponse ---

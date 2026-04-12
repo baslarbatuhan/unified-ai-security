@@ -35,11 +35,17 @@ Decision = Literal["allow", "sanitize", "flag", "block"]
 
 THRESHOLDS = {"allow": 0.30, "sanitize": 0.60, "block": 0.85}
 
-def _decide(score: float) -> Decision:
-    if score < THRESHOLDS["allow"]: return "allow"
-    elif score < THRESHOLDS["sanitize"]: return "sanitize"
-    elif score >= THRESHOLDS["block"]: return "block"
-    else: return "flag"
+
+def _decide(score: float, thresholds: Optional[Dict[str, float]] = None) -> Decision:
+    th = thresholds or THRESHOLDS
+    if score < th["allow"]:
+        return "allow"
+    elif score < th["sanitize"]:
+        return "sanitize"
+    elif score >= th["block"]:
+        return "block"
+    else:
+        return "flag"
 
 
 @dataclass
@@ -78,12 +84,22 @@ class RetrievalRiskResult:
 class RetrievalRiskScorer:
     """Enhanced risk scoring for RAG retrieval results."""
 
-    def __init__(self, poison_threshold: float = 0.55, weights: Optional[Dict] = None):
+    def __init__(
+        self,
+        poison_threshold: float = 0.55,
+        weights: Optional[Dict] = None,
+        decision_thresholds: Optional[Dict[str, float]] = None,
+    ):
         self.poison_threshold = poison_threshold
         self.weights = weights or {
             "top_k_ratio": 0.25, "max_score": 0.30,
             "consistency": 0.20, "positional": 0.25,
         }
+        self.decision_thresholds = decision_thresholds or dict(THRESHOLDS)
+
+    def decide(self, score: float) -> Decision:
+        """Final decision bands aligned with fusion gateway (configs/policy_thresholds)."""
+        return _decide(score, self.decision_thresholds)
 
     def _top_k_poison_ratio(self, scores: List[DocScore]) -> float:
         if not scores: return 0.0
@@ -94,7 +110,10 @@ class RetrievalRiskScorer:
         return max(s.poison_score for s in scores)
 
     def _consistency_score(self, scores: List[DocScore]) -> float:
-        if len(scores) < 2: return 0.0
+        if len(scores) < 2:
+            # Single doc: consistency cannot be computed, fall back to
+            # the document's own poison score so the signal is not lost.
+            return scores[0].poison_score if scores else 0.0
         values = [s.poison_score for s in scores]
         mean = sum(values) / len(values)
         variance = sum((v - mean) ** 2 for v in values) / len(values)
@@ -119,12 +138,20 @@ class RetrievalRiskScorer:
         consist = self._consistency_score(doc_scores)
         positional = self._positional_score(doc_scores)
 
-        w = self.weights
+        # Single-doc: redistribute consistency weight to max_score
+        # (consistency is meaningless with 1 document)
+        if len(doc_scores) == 1:
+            w = {
+                "top_k_ratio": 0.25, "max_score": 0.50,
+                "consistency": 0.0, "positional": 0.25,
+            }
+        else:
+            w = self.weights
         risk = round(min(w["top_k_ratio"]*ratio + w["max_score"]*max_s +
                          w["consistency"]*consist + w["positional"]*positional, 1.0), 4)
 
         flagged = [s for s in doc_scores if s.poison_score >= self.poison_threshold]
-        confidence = 0.90 if len(doc_scores) >= 5 else 0.80 if len(doc_scores) >= 3 else 0.65
+        confidence = 0.90 if len(doc_scores) >= 5 else 0.80 if len(doc_scores) >= 3 else 0.70
 
         evidence = []
         if flagged:
@@ -136,7 +163,7 @@ class RetrievalRiskScorer:
         evidence.append(f"Components: ratio={ratio:.3f}, max={max_s:.3f}, consistency={consist:.3f}, positional={positional:.3f}")
 
         return RetrievalRiskResult(
-            risk_score=risk, confidence=confidence, decision=_decide(risk), evidence=evidence,
+            risk_score=risk, confidence=confidence, decision=self.decide(risk), evidence=evidence,
             top_k_poison_ratio=round(ratio, 4), max_poison_score=round(max_s, 4),
             consistency_score=round(consist, 4), positional_score=round(positional, 4),
             total_docs=len(doc_scores), flagged_docs=len(flagged),

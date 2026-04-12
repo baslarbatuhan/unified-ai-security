@@ -47,12 +47,11 @@ _FILE_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _FILE_DIR.parent if _FILE_DIR.name == "tests" else _FILE_DIR
 
 sys.path.insert(0, str(_PROJECT_ROOT))
-sys.path.insert(0, str(_PROJECT_ROOT / "output_agency_defense"))
 
-from behavior_monitor import BehaviorMonitor, BehaviorAssessment, run_scenario
-from behavior_risk_model import BehaviorRiskModel
-from anti_enum_guard import AntiEnumGuard
-from parameter_validation import ParameterValidator
+from output_agency_defense.behavior_monitor import BehaviorMonitor, BehaviorAssessment, run_scenario
+from output_agency_defense.behavior_risk_model import BehaviorRiskModel
+from output_agency_defense.anti_enum_guard import AntiEnumGuard
+from output_agency_defense.parameter_validation import ParameterValidator
 
 _RUNS_DIR = _PROJECT_ROOT / "runs"
 
