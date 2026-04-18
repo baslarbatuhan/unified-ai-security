@@ -27,9 +27,13 @@ policy:
     # flags a critical threat.
     override:
       critical_threshold: 0.85
-      critical_multiplier: 0.90
+      critical_multiplier: 0.95
       elevated_threshold: 0.60
-      elevated_multiplier: 0.85
+      # 1.0 = preserve module_max verbatim when any module is in elevated band.
+      # Earlier 0.85 was pulling 0.67 → 0.57, flipping a flag to sanitize.
+      # Standalone RAG module already decides at 0.60, so the gateway should
+      # not soften that decision by a weighted-sum penalty.
+      elevated_multiplier: 1.0
 
 modules:
   output_agency:
@@ -50,6 +54,13 @@ modules:
     llm_judge:
       embedding_weight: 0.3
       judge_weight: 0.7
+      judge_abstain_threshold: 0.15
+      embedding_override_multiplier: 0.85
+      # Chunk-based analysis: split doc into sentence groups, judge each, take max score.
+      # Defeats "holistic dilution" where judge averages over 90% clean + 10% poison.
+      # Trade-off: ~3x latency increase (per doc split into 3-4 chunks).
+      enable_chunked_analysis: true
+      chunk_size: 3
     context_filter:
       removal_threshold: 0.45
       low_confidence_threshold: 0.30

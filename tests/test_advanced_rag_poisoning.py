@@ -26,6 +26,13 @@ _PROJECT_ROOT = _FILE_DIR.parent if _FILE_DIR.name == "tests" else _FILE_DIR
 _RUNS_DIR = _PROJECT_ROOT / "runs"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# Load environment variables (HF_TOKEN, etc.) before importing any model code
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 try:
     from rag_guard.poison_detector import PoisonDetector
     from rag_guard.context_filter import ContextFilter

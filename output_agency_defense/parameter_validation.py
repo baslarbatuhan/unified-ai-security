@@ -29,7 +29,7 @@ SUSPICIOUS_PATTERNS = [
     (re.compile(r"['\";].*(--)"), "sql_injection"),
     (re.compile(r"(\.\./|\.\.\\)"), "path_traversal"),
     (re.compile(r"<script", re.I), "xss"),
-    (re.compile(r"(\$\{|`.*`)"), "command_injection"),
+    (re.compile(r"(\$\{|`.*`|(?<!\w)[;&|<>]|\$\(|&&|\|\|)"), "command_injection"),
     (re.compile(r"__import__\s*\("), "python_injection"),
     (re.compile(r"(\x00|\x0a|\x0d)"), "null_byte"),
 ]

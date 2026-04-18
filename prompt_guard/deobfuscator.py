@@ -185,12 +185,47 @@ def _decode_multi_leet(text: str) -> str:
     return text
 
 
+def _find_digit_run(chars: list, pos: int) -> tuple:
+    """Find the start and end index of a consecutive digit run containing pos.
+
+    Returns (run_start, run_end) inclusive.
+    """
+    start = pos
+    while start > 0 and chars[start - 1].isdigit():
+        start -= 1
+    end = pos
+    while end < len(chars) - 1 and chars[end + 1].isdigit():
+        end += 1
+    return start, end
+
+
+def _should_preserve_digit_run(chars: list, run_start: int, run_end: int) -> bool:
+    """Decide if a consecutive digit run should be preserved (not decoded).
+
+    Position-based heuristic:
+      - Standalone (no alpha on either side): preserve  → "port 8080"
+      - Suffix (alpha left, no alpha right): preserve   → "ROT13", "MP3"
+      - Prefix (no alpha left, alpha right):  decode     → "73ll" = "tell"
+      - Middle (alpha on both sides):         decode     → "pr3v10u5" = "previous"
+    """
+    left_alpha = run_start > 0 and chars[run_start - 1].isalpha()
+    right_alpha = run_end < len(chars) - 1 and chars[run_end + 1].isalpha()
+
+    if not left_alpha and not right_alpha:
+        return True   # standalone number
+    if left_alpha and not right_alpha:
+        return True   # number suffix (ROT13, MP3, PS4)
+    return False      # prefix or middle → likely leet
+
+
 def _decode_leetspeak(text: str) -> str:
     """Context-aware single-character leetspeak decoding.
 
     Guards:
-    1. Only decodes when at least one neighbor is a letter.
-    2. Never decodes digits in consecutive-digit runs (2+).
+    1. Only decodes when at least one neighbor is a letter,
+       OR when the character is at a word boundary with a letter on the other side.
+    2. Preserves standalone numbers ("port 8080", "ROT13") but decodes
+       digit runs embedded in words ("pr3v10u5" → "previous").
     """
     chars = list(text)
     result = []
@@ -200,19 +235,33 @@ def _decode_leetspeak(text: str) -> str:
             result.append(ch)
             continue
 
-        # Guard: skip digits that are part of a consecutive digit run
+        # Guard: for digits in a consecutive run, only preserve if standalone number
         if ch.isdigit():
             prev_digit = i > 0 and chars[i - 1].isdigit()
             next_digit = i < len(chars) - 1 and chars[i + 1].isdigit()
             if prev_digit or next_digit:
-                result.append(ch)
+                run_start, run_end = _find_digit_run(chars, i)
+                if _should_preserve_digit_run(chars, run_start, run_end):
+                    # Real number like "8080", "13" at end of "ROT13" → preserve
+                    result.append(ch)
+                    continue
+                # Embedded in a word like "10" in "pr3v10u5" → decode as leet
+                result.append(LEET_MAP[ch])
                 continue
 
-        # Guard: at least one neighbor must be a letter
+        # Neighbor analysis
         prev_alpha = i > 0 and chars[i - 1].isalpha()
         next_alpha = i < len(chars) - 1 and chars[i + 1].isalpha()
 
+        # Word boundary analysis: treat start/end of word as valid context
+        at_word_start = (i == 0) or (not chars[i - 1].isalnum())
+        at_word_end = (i == len(chars) - 1) or (not chars[i + 1].isalnum())
+
         if prev_alpha or next_alpha:
+            result.append(LEET_MAP[ch])
+        elif at_word_end and prev_alpha:
+            result.append(LEET_MAP[ch])
+        elif at_word_start and next_alpha:
             result.append(LEET_MAP[ch])
         else:
             result.append(ch)
@@ -242,6 +291,10 @@ def deobfuscate(text: str) -> str:
     text = _replace_unicode_digits(text)
     text = _decode_multi_leet(text)
     text = _decode_leetspeak(text)
+    # Second pass: first pass may create new alpha-neighbor contexts
+    # e.g. "1gn0r3" → pass1: "ign0re" → pass2: "ignore"
+    if any(ch in LEET_MAP for ch in text):
+        text = _decode_leetspeak(text)
     text = _squeeze_repeats(text)
     return text
 
@@ -255,6 +308,9 @@ def get_deobfuscation_report(text: str) -> Dict:
     after_unicode = _replace_unicode_digits(after_homo)
     after_multi = _decode_multi_leet(after_unicode)
     after_leet = _decode_leetspeak(after_multi)
+    # Second pass for residual leet chars
+    if any(ch in LEET_MAP for ch in after_leet):
+        after_leet = _decode_leetspeak(after_leet)
     final = _squeeze_repeats(after_leet)
 
     changes = []

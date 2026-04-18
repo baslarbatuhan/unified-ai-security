@@ -26,6 +26,13 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# Load environment variables (HF_TOKEN, etc.) before importing any model code
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional

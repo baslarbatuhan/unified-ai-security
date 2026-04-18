@@ -200,12 +200,13 @@ def _max_agency_risk(
     tool_candidates: Optional[List[Dict[str, Any]]],
     user_id: str,
     role: str,
+    user_prompt: Optional[str] = None,
 ) -> ModuleRisk:
     """Single tool_call or max risk across multiple candidates (conservative)."""
     if tool_candidates:
-        risks = [_evaluate_agency_guard(tc, user_id, role) for tc in tool_candidates]
+        risks = [_evaluate_agency_guard(tc, user_id, role, user_prompt) for tc in tool_candidates]
         if not risks:
-            return _evaluate_agency_guard(None, user_id, role)
+            return _evaluate_agency_guard(None, user_id, role, user_prompt)
         best = max(risks, key=lambda r: r.risk_score)
         if len(risks) > 1:
             ev = [f"Max agency risk over {len(risks)} tool candidate(s)"] + list(best.evidence)
@@ -218,7 +219,7 @@ def _max_agency_risk(
                 latency_ms=best.latency_ms,
             )
         return best
-    return _evaluate_agency_guard(tool_call, user_id, role)
+    return _evaluate_agency_guard(tool_call, user_id, role, user_prompt)
 
 
 def _build_rag_pipeline_from_yaml() -> Any:
@@ -239,8 +240,12 @@ def _build_rag_pipeline_from_yaml() -> Any:
     cf = rag.get("context_filter") or {}
     llm = cfg.get("llm") or {}
 
-    emb_w = float(lj.get("embedding_weight", 0.4))
-    judge_w = float(lj.get("judge_weight", 0.6))
+    emb_w = float(lj.get("embedding_weight", 0.5))
+    judge_w = float(lj.get("judge_weight", 0.5))
+    judge_abstain = float(lj.get("judge_abstain_threshold", 0.15))
+    emb_override_mul = float(lj.get("embedding_override_multiplier", 0.85))
+    enable_chunked = bool(lj.get("enable_chunked_analysis", False))
+    chunk_size = int(lj.get("chunk_size", 3))
     removal = float(cf.get("removal_threshold", 0.55))
     low_c = float(cf.get("low_confidence_threshold", 0.35))
     min_safe = int(cf.get("min_safe_docs", 2))
@@ -264,6 +269,10 @@ def _build_rag_pipeline_from_yaml() -> Any:
         low_confidence_threshold=low_c,
         min_safe_docs=min_safe,
         risk_scorer=rsc,
+        judge_abstain_threshold=judge_abstain,
+        embedding_override_multiplier=emb_override_mul,
+        enable_chunked_analysis=enable_chunked,
+        chunk_size=chunk_size,
     )
 
 
@@ -369,8 +378,18 @@ def _evaluate_agency_guard(
     tool_call: Optional[Dict],
     user_id: str,
     role: str,
+    user_prompt: Optional[str] = None,
 ) -> ModuleRisk:
-    """Run agency guard on tool call."""
+    """Run agency guard on tool call.
+
+    Args:
+        tool_call:    Extracted tool call dict (tool + args).
+        user_id:      Requesting user identifier.
+        role:         User role (basic / viewer / admin).
+        user_prompt:  Original raw user message — scanned for pre-LLM
+                      attack indicators BEFORE the LLM had a chance to
+                      sanitise the payload.
+    """
     t0 = time.time()
     if not tool_call:
         return ModuleRisk(
@@ -383,6 +402,7 @@ def _evaluate_agency_guard(
         from output_agency_defense.object_authz_guard import ObjectAuthzGuard, Session
         from output_agency_defense.anti_enum_guard import AntiEnumGuard
         from output_agency_defense.parameter_validation import ParameterValidator
+        from output_agency_defense.prompt_scanner import scan_user_prompt
 
         registry = create_demo_registry()
         authz = ObjectAuthzGuard(registry)
@@ -396,6 +416,16 @@ def _evaluate_agency_guard(
 
         evidence = []
         risk_score = 0.0
+
+        # --- Pre-LLM prompt scan -----------------------------------------------
+        # Detects attacks that the LLM might sanitise before the tool-call guard
+        # sees them (e.g., "ORD-001; rm -rf /" → LLM extracts clean resource_id).
+        if user_prompt:
+            scan_result = scan_user_prompt(user_prompt)
+            if scan_result.detected:
+                risk_score = max(risk_score, scan_result.risk_bump)
+                evidence.extend(scan_result.to_evidence())
+        # -----------------------------------------------------------------------
 
         # Tool allowlist — derived from _register_gateway_demo_schemas (single source of truth)
         REGISTERED_TOOLS = set(param_validator._schemas.keys())
@@ -550,7 +580,7 @@ class FusionEngine:
                 if enabled.get("rag_guard", True) else _disabled_module_risk("rag_guard")
             )
             agency_risk = (
-                _max_agency_risk(tool_call, tool_candidates, user_id, role)
+                _max_agency_risk(tool_call, tool_candidates, user_id, role, user_input)
                 if enabled.get("output_agency", True) else _disabled_module_risk("output_agency")
             )
 
@@ -634,7 +664,7 @@ class FusionEngine:
                 )
             if enabled.get("output_agency", True):
                 future_agency = executor.submit(
-                    _max_agency_risk, tool_call, tool_candidates, user_id, role,
+                    _max_agency_risk, tool_call, tool_candidates, user_id, role, user_input,
                 )
 
             def _safe_result(future, module_name: str, disabled: ModuleRisk) -> ModuleRisk:

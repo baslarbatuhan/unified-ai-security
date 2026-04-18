@@ -167,6 +167,10 @@ class RAGGuardPipeline:
         removal_threshold: Optional[float] = None,
         low_confidence_threshold: float = 0.35,
         min_safe_docs: int = 2,
+        judge_abstain_threshold: float = 0.15,
+        embedding_override_multiplier: float = 0.85,
+        enable_chunked_analysis: bool = False,
+        chunk_size: int = 3,
     ):
         self.detector = detector or PoisonDetector()
         self.judge = judge or LLMJudge()
@@ -181,6 +185,10 @@ class RAGGuardPipeline:
         self.embedding_weight = embedding_weight
         self.judge_weight = judge_weight
         self.poison_threshold = poison_threshold
+        self.judge_abstain_threshold = judge_abstain_threshold
+        self.embedding_override_multiplier = embedding_override_multiplier
+        self.enable_chunked_analysis = enable_chunked_analysis
+        self.chunk_size = chunk_size
 
     def run(
         self,
@@ -218,7 +226,13 @@ class RAGGuardPipeline:
         if use_judge:
             try:
                 if self.judge.is_available():
-                    judge_batch = self.judge.analyze_batch(documents, user_query=user_query)
+                    if getattr(self, "enable_chunked_analysis", False):
+                        chunk_size = int(getattr(self, "chunk_size", 3))
+                        judge_batch = self.judge.analyze_batch_chunked(
+                            documents, user_query=user_query, chunk_size=chunk_size
+                        )
+                    else:
+                        judge_batch = self.judge.analyze_batch(documents, user_query=user_query)
                     judge_available = True
                     model_used = judge_batch.model_used
                     for jr in judge_batch.results:
@@ -238,11 +252,32 @@ class RAGGuardPipeline:
             if judge_available and doc_id in judge_results:
                 jr = judge_results[doc_id]
                 judge_score = jr.judge_score
-                combined = (
-                    self.embedding_weight * embedding_score
-                    + self.judge_weight * judge_score
-                )
                 explanation = jr.explanation
+
+                # Per-doc judge error: if this specific doc had a timeout/error,
+                # treat as embedding-only (don't let a failed call dilute the score)
+                if jr.error:
+                    judge_score = 0.0
+                    combined = embedding_score
+                    explanation = f"[judge-error: {jr.error}] embedding-only fallback"
+                # Judge abstention rule: if judge score is suspiciously low
+                # while embedding is elevated, the judge may be failing on a
+                # subtle attack — fall back to embedding-only for this doc
+                elif (judge_score < self.judge_abstain_threshold
+                        and embedding_score >= (self.poison_threshold - 0.05)):
+                    combined = embedding_score
+                    explanation += " [judge-abstain: embedding override]"
+                else:
+                    combined = (
+                        self.embedding_weight * embedding_score
+                        + self.judge_weight * judge_score
+                    )
+
+                # Embedding floor rule: if embedding alone exceeds threshold,
+                # never let judge pull combined below a safe floor
+                if not jr.error and embedding_score >= self.poison_threshold:
+                    floor = embedding_score * self.embedding_override_multiplier
+                    combined = max(combined, floor)
             else:
                 # Fallback: embedding only
                 judge_score = 0.0
