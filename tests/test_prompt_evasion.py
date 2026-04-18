@@ -33,15 +33,24 @@ _PROJECT_ROOT = _FILE_DIR.parent if _FILE_DIR.name == "tests" else _FILE_DIR
 _RUNS_DIR = _PROJECT_ROOT / "runs"
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+# Load environment variables (HF_TOKEN, etc.) before importing any model code
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env")
+except ImportError:
+    pass
+
 try:
     from prompt_guard.prompt_normalizer import normalize_prompt, get_normalization_report
     from prompt_guard.semantic_evaluator_v1 import SemanticEvaluator
     from prompt_guard.pattern_detector import PatternDetector
+    from prompt_guard.pipeline import PromptGuardPipeline
 except ImportError:
     sys.path.insert(0, str(_PROJECT_ROOT / "prompt_guard"))
     from prompt_normalizer import normalize_prompt, get_normalization_report
     from semantic_evaluator_v1 import SemanticEvaluator
     from pattern_detector import PatternDetector
+    from pipeline import PromptGuardPipeline
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +144,11 @@ def run_prompt_evasion_tests() -> Dict:
     print(f"  Total variants: {len(BASE_ATTACKS) * len(EVASION_TECHNIQUES)}")
     print(f"{'='*70}")
 
-    # Initialize pipeline
+    # Initialize: use full pipeline (deobfuscate → normalize → detect)
+    # This exercises the complete chain including deobfuscator and adaptive threshold
+    pipeline = PromptGuardPipeline()
+    # Also keep raw evaluator for comparison
     evaluator = SemanticEvaluator()
-    pattern_det = PatternDetector()
     threshold = 0.65
 
     results = []
@@ -152,22 +163,20 @@ def run_prompt_evasion_tests() -> Dict:
             # Generate evasion variant
             variant = transform_fn(base_attack)
 
-            # --- Test 1: Raw variant (no normalization) ---
+            # --- Test 1: Raw variant (no deobfuscation/normalization) ---
             t0 = time.time()
             raw_sem_score = evaluator.evaluate(variant).semantic_score
-            raw_pattern = pattern_det.detect(variant)
             raw_latency = int((time.time() - t0) * 1000)
+            raw_detected = raw_sem_score >= threshold
 
-            raw_detected = raw_sem_score >= threshold or raw_pattern.is_detected
-
-            # --- Test 2: Normalized variant ---
+            # --- Test 2: Full pipeline (deobfuscate → normalize → detect) ---
             t1 = time.time()
-            normalized = normalize_prompt(variant)
-            norm_sem_score = evaluator.evaluate(normalized).semantic_score
-            norm_pattern = pattern_det.detect(normalized)
-            norm_latency = int((time.time() - t1) * 1000)
+            pipe_result = pipeline.run(variant)
+            pipe_latency = int((time.time() - t1) * 1000)
 
-            norm_detected = norm_sem_score >= threshold or norm_pattern.is_detected
+            norm_detected = pipe_result.is_injection
+            norm_sem_score = pipe_result.semantic.semantic_score if pipe_result.semantic else 0.0
+            norm_pattern = pipe_result.pattern
 
             # Track stats
             technique_stats[tech_name]["total"] += 1
@@ -178,13 +187,10 @@ def run_prompt_evasion_tests() -> Dict:
             if not norm_detected:
                 technique_stats[tech_name]["evaded"] += 1
 
-            # Decision based on normalized
-            if norm_detected:
-                decision = "block" if norm_sem_score >= 0.85 else "flag"
-                risk_score = max(norm_sem_score, norm_pattern.pattern_score)
-            else:
-                decision = "allow"
-                risk_score = norm_sem_score
+            # Decision from pipeline
+            risk = pipe_result.risk
+            risk_score = risk.risk_score if risk else norm_sem_score
+            decision = risk.decision if risk else "allow"
 
             short_variant = variant[:50] + "..." if len(variant) > 50 else variant
             status = "DETECTED" if norm_detected else "EVADED"
@@ -198,11 +204,11 @@ def run_prompt_evasion_tests() -> Dict:
                 "detected": norm_detected,
                 "risk_score": round(risk_score, 4),
                 "decision": decision,
-                "latency_ms": norm_latency,
+                "latency_ms": pipe_latency,
                 "raw_semantic_score": round(raw_sem_score, 4),
                 "normalized_semantic_score": round(norm_sem_score, 4),
-                "pattern_detected": norm_pattern.is_detected,
-                "normalization_changed": normalized != variant,
+                "pattern_detected": norm_pattern.is_detected if norm_pattern else False,
+                "normalization_changed": pipe_result.deobfuscated_prompt != variant or pipe_result.normalized_prompt != pipe_result.deobfuscated_prompt,
             })
 
     # --- METRICS ---

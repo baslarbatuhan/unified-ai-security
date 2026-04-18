@@ -26,6 +26,12 @@ services:
     volumes:
       - hf_cache:/app/.cache/huggingface
       - gateway_logs:/app/logs
+      # Configs stay bound (read-only YAML tweaks expected without rebuild).
+      # Source-tree bind mounts live in docker-compose.override.yml (dev only,
+      # auto-loaded by `docker compose up`). For reproducible runs use:
+      #   docker compose -f docker-compose.yml up
+      # which ignores the override and runs image-built code only.
+      - ../configs:/app/configs:ro
     depends_on:
       chroma:
         condition: service_started

@@ -162,6 +162,11 @@ class PromptGuardPipeline:
             else:
                 adaptive_threshold = self.semantic_threshold
 
+        # If deobfuscation changed the text, the input is likely adversarial
+        # → lower threshold to catch borderline evasion attempts
+        if deob_report["changed"]:
+            adaptive_threshold -= 0.05
+
         # Apply adaptive threshold for this evaluation
         original_threshold = self.evaluator.threshold
         self.evaluator.threshold = adaptive_threshold
