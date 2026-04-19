@@ -112,6 +112,7 @@ def run_advanced_hybrid_test(use_judge: bool = True) -> Dict:
         combined = ds0.combined_score if ds0 else 0.0
         detected = bool(ds0 and ds0.is_suspicious)
         explanation = ds0.judge_explanation if ds0 else ""
+        chunk_breakdown = ds0.chunk_scores if ds0 else None
 
         rr = result.risk_result
         risk_score = rr.risk_score if rr else 0.0
@@ -159,6 +160,7 @@ def run_advanced_hybrid_test(use_judge: bool = True) -> Dict:
             "evasion_technique": pdoc.get("evasion_technique", ""),
             "target_query": target_query[:80],
             "judge_explanation": explanation[:200] if explanation else "",
+            "chunk_breakdown": json.dumps(chunk_breakdown) if chunk_breakdown else "",
             "latency_ms": latency_ms,
             "judge_available": result.judge_available,
             "test_set": "poisoned",
@@ -220,6 +222,7 @@ def run_advanced_hybrid_test(use_judge: bool = True) -> Dict:
             "evasion_technique": "",
             "target_query": query[:80],
             "judge_explanation": "",
+            "chunk_breakdown": "",
             "latency_ms": latency_ms,
             "judge_available": result.judge_available,
             "test_set": "clean",
@@ -279,6 +282,7 @@ def run_advanced_hybrid_test(use_judge: bool = True) -> Dict:
         "embedding_score", "judge_score", "combined_score",
         "risk_score", "decision", "poison_type", "poison_technique",
         "evasion_technique", "target_query", "judge_explanation",
+        "chunk_breakdown",
         "latency_ms", "judge_available", "test_set",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
