@@ -246,6 +246,9 @@ def _build_rag_pipeline_from_yaml() -> Any:
     emb_override_mul = float(lj.get("embedding_override_multiplier", 0.85))
     enable_chunked = bool(lj.get("enable_chunked_analysis", False))
     chunk_size = int(lj.get("chunk_size", 3))
+    chunk_overlap = int(lj.get("chunk_overlap", 0))
+    chunk_aggregation = str(lj.get("chunk_aggregation", "max"))
+    embedding_gate_threshold = float(lj.get("embedding_gate_threshold", 0.0))
     removal = float(cf.get("removal_threshold", 0.55))
     low_c = float(cf.get("low_confidence_threshold", 0.35))
     min_safe = int(cf.get("min_safe_docs", 2))
@@ -273,6 +276,9 @@ def _build_rag_pipeline_from_yaml() -> Any:
         embedding_override_multiplier=emb_override_mul,
         enable_chunked_analysis=enable_chunked,
         chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        chunk_aggregation=chunk_aggregation,
+        embedding_gate_threshold=embedding_gate_threshold,
     )
 
 
@@ -333,12 +339,36 @@ def _evaluate_rag_guard(
         result = pipeline.run(documents, user_query=user_query)
         risk_dict = result.to_module_risk_dict()
 
+        # On block/sanitize decisions, log which chunk triggered the worst
+        # judge score so auditors can trace the decision back to a specific
+        # span in the retrieved doc (was opaque with doc-level max only).
+        evidence = list(risk_dict["evidence"])
+        decision = risk_dict["decision"]
+        if decision in ("block", "sanitize") and result.doc_scores:
+            worst = max(
+                result.doc_scores,
+                key=lambda ds: ds.combined_score,
+                default=None,
+            )
+            if worst and worst.chunk_scores:
+                top_chunks = sorted(
+                    worst.chunk_scores,
+                    key=lambda c: c.get("judge_score", 0.0),
+                    reverse=True,
+                )[:2]
+                for c in top_chunks:
+                    evidence.append(
+                        f"Triggering chunk doc={worst.doc_id} idx={c['idx']} "
+                        f"judge={c['judge_score']:.3f} "
+                        f"text={c['text_preview'][:80]!r}"
+                    )
+
         return ModuleRisk(
             module="rag_guard",
             risk_score=risk_dict["risk_score"],
             confidence=risk_dict["confidence"],
-            decision=risk_dict["decision"],
-            evidence=risk_dict["evidence"],
+            decision=decision,
+            evidence=evidence,
             latency_ms=int((time.time() - t0) * 1000),
         )
     except Exception as e:

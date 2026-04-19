@@ -97,6 +97,9 @@ class CombinedDocScore:
     is_suspicious: bool = False
     judge_explanation: str = ""
     judge_available: bool = True
+    # Per-chunk breakdown forwarded from LLMJudge.analyze_chunked().
+    # None when chunking is disabled or doc was too short to split.
+    chunk_scores: Optional[List[Dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +174,9 @@ class RAGGuardPipeline:
         embedding_override_multiplier: float = 0.85,
         enable_chunked_analysis: bool = False,
         chunk_size: int = 3,
+        chunk_overlap: int = 0,
+        chunk_aggregation: str = "max",
+        embedding_gate_threshold: float = 0.0,
     ):
         self.detector = detector or PoisonDetector()
         self.judge = judge or LLMJudge()
@@ -189,6 +195,9 @@ class RAGGuardPipeline:
         self.embedding_override_multiplier = embedding_override_multiplier
         self.enable_chunked_analysis = enable_chunked_analysis
         self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.chunk_aggregation = chunk_aggregation
+        self.embedding_gate_threshold = embedding_gate_threshold
 
     def run(
         self,
@@ -228,8 +237,18 @@ class RAGGuardPipeline:
                 if self.judge.is_available():
                     if getattr(self, "enable_chunked_analysis", False):
                         chunk_size = int(getattr(self, "chunk_size", 3))
+                        chunk_overlap = int(getattr(self, "chunk_overlap", 0))
+                        aggregation = str(getattr(self, "chunk_aggregation", "max"))
+                        gate_thr = float(getattr(self, "embedding_gate_threshold", 0.0))
+                        gate_detector = self.detector if gate_thr > 0.0 else None
                         judge_batch = self.judge.analyze_batch_chunked(
-                            documents, user_query=user_query, chunk_size=chunk_size
+                            documents,
+                            user_query=user_query,
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                            aggregation=aggregation,
+                            embedding_gate_threshold=gate_thr,
+                            embedding_gate_detector=gate_detector,
                         )
                     else:
                         judge_batch = self.judge.analyze_batch(documents, user_query=user_query)
@@ -290,6 +309,11 @@ class RAGGuardPipeline:
             if is_suspicious:
                 suspicious_count += 1
 
+            # Forward per-chunk breakdown if judge ran in chunked mode
+            chunk_breakdown = None
+            if judge_available and doc_id in judge_results:
+                chunk_breakdown = judge_results[doc_id].chunk_scores
+
             combined_scores.append(CombinedDocScore(
                 doc_id=doc_id,
                 embedding_score=round(embedding_score, 4),
@@ -298,6 +322,7 @@ class RAGGuardPipeline:
                 is_suspicious=is_suspicious,
                 judge_explanation=explanation,
                 judge_available=judge_available,
+                chunk_scores=chunk_breakdown,
             ))
 
             doc_scores_for_risk.append(DocScore(
@@ -326,6 +351,35 @@ class RAGGuardPipeline:
                 )
                 risk_result.risk_score = floor
                 risk_result.decision = self.risk_scorer.decide(risk_result.risk_score)
+
+        # --- Stage 4c: Embedding-floor amplification (D_fusion_gap fix) ---
+        # When embedding alone exceeds the poison threshold but the judge
+        # abstained (camouflaged content, lookalike URLs, etc.), the risk
+        # scorer tends to dilute the combined score to ~0.34–0.41. That is
+        # above standalone's "sanitize" but below the gateway's 0.60 flag
+        # threshold, causing TP at standalone to become allow at gateway.
+        # Solution: promote risk_score to at least 0.60 when embedding
+        # clearly fires, preserving the standalone decision end-to-end.
+        embedding_triggered = any(
+            ds.embedding_score >= self.poison_threshold
+            for ds in combined_scores
+        )
+        if embedding_triggered and risk_result.risk_score < 0.60:
+            max_combined = max((ds.combined_score for ds in combined_scores),
+                               default=0.0)
+            floor = round(max(max_combined, 0.60), 4)
+            risk_result.evidence.append(
+                f"Embedding-floor amplification: floor={floor:.4f} "
+                f"(embedding>=threshold, judge did not override)"
+            )
+            risk_result.risk_score = floor
+            risk_result.decision = self.risk_scorer.decide(risk_result.risk_score)
+            # Propagate suspicion to the doc(s) that triggered the embedding
+            # floor so downstream consumers (test harness, gateway evidence)
+            # see a consistent is_suspicious flag.
+            for ds in combined_scores:
+                if ds.embedding_score >= self.poison_threshold and not ds.is_suspicious:
+                    ds.is_suspicious = True
 
         # Add judge info to evidence
         if judge_available:

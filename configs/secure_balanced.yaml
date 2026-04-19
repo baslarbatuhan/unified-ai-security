@@ -60,7 +60,16 @@ modules:
       # Defeats "holistic dilution" where judge averages over 90% clean + 10% poison.
       # Trade-off: ~3x latency increase (per doc split into 3-4 chunks).
       enable_chunked_analysis: true
-      chunk_size: 3
+      # chunk_size=2, aggregation=max chosen from Week 7 chunking sweep
+      # (see reports/chunking_ablation.md). cs2+max → recall=0.933, F1=0.966;
+      # cs3+max only reaches recall=0.867 but halves latency.
+      chunk_size: 2
+      chunk_overlap: 0
+      chunk_aggregation: max
+      # Routing optimization: if > 0.0, skip LLM call for chunks whose
+      # PoisonDetector embedding score is below this threshold. Reduces
+      # judge-call count on obviously-clean chunks. 0.0 = always call.
+      embedding_gate_threshold: 0.0
     context_filter:
       removal_threshold: 0.45
       low_confidence_threshold: 0.30
