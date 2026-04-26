@@ -20,12 +20,13 @@ Output:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -120,7 +121,149 @@ def _run_pipeline(pipe: PromptGuardPipeline, benign: List[str]) -> Dict[str, Any
     }
 
 
-def main() -> int:
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Prompt Guard stability — FP check and (optional) regression metrics."
+    )
+    ap.add_argument(
+        "--dataset",
+        choices=["benign", "regression"],
+        default="benign",
+        help=(
+            "'benign' (default): legacy FP-only mode using injection_dataset_v1.csv "
+            "label==0 rows. 'regression': use datasets/prompt_regression_set.json "
+            "(curated benign + attack cases) to compute precision/recall/F1/FPR."
+        ),
+    )
+    ap.add_argument(
+        "--regression-path",
+        default=None,
+        help="Override path for the regression JSON (defaults to datasets/prompt_regression_set.json).",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Regression mode only: treat only decision=='block' as positive. "
+             "Default counts any non-allow decision as positive (module-level).",
+    )
+    return ap.parse_args(argv)
+
+
+def _run_regression_mode(args: argparse.Namespace) -> int:
+    """Regression mode: curated set → precision/recall/F1/FPR + per-category."""
+    sys.path.insert(0, str(_PROJECT_ROOT))  # ensure `datasets.*` importable
+    from datasets.dataset_loaders import (  # noqa: E402
+        DEFAULT_PROMPT_REGRESSION_SET, load_prompt_regression_set,
+        compute_confusion, compute_metrics, per_category_breakdown,
+    )
+
+    ds_path = Path(args.regression_path) if args.regression_path else DEFAULT_PROMPT_REGRESSION_SET
+    cases = load_prompt_regression_set(ds_path)
+    print(f"[prompt_guard_stability] dataset=regression path={ds_path} "
+          f"cases={len(cases)} (benign={sum(c.is_benign for c in cases)} "
+          f"attack={sum(c.is_attack for c in cases)})")
+
+    yaml_thr = _thresholds_from_yaml()
+    pipe = PromptGuardPipeline(
+        semantic_threshold=yaml_thr["semantic_threshold"],
+        adaptive_tier_thresholds=(yaml_thr["short"], yaml_thr["medium"], yaml_thr["long"]),
+    )
+
+    observed: Dict[str, str] = {}
+    per_case_rows: List[Dict[str, Any]] = []
+    total_latency = 0
+    for c in cases:
+        t0 = time.time()
+        r = pipe.run(c.prompt)
+        lat = int((time.time() - t0) * 1000)
+        total_latency += lat
+        decision = r.risk.decision if r.risk else "allow"
+        risk = r.risk.risk_score if r.risk else 0.0
+        observed[c.id] = decision
+        per_case_rows.append({
+            "id": c.id,
+            "category": c.category,
+            "label": c.label,
+            "expected": c.expected_decision,
+            "observed": decision,
+            "risk": round(risk, 4),
+            "match": int(decision == c.expected_decision),
+            "latency_ms": lat,
+        })
+
+    # Metrics under two positivity modes: strict (block only) and soft (any non-allow).
+    cm_strict = compute_confusion(cases, observed, strict=True)
+    m_strict = compute_metrics(cm_strict)
+    cm_soft = compute_confusion(cases, observed, strict=False)
+    m_soft = compute_metrics(cm_soft)
+    # Use the CLI-selected mode for the category breakdown.
+    per_cat = per_category_breakdown(cases, observed, strict=args.strict)
+
+    summary = {
+        "mode": "regression",
+        "dataset": str(ds_path.relative_to(_PROJECT_ROOT))
+                   if ds_path.is_absolute() and ds_path.is_relative_to(_PROJECT_ROOT)
+                   else str(ds_path),
+        "thresholds_used": yaml_thr,
+        "total_cases": len(cases),
+        "strict": {"confusion": cm_strict, **m_strict},
+        "soft":   {"confusion": cm_soft,   **m_soft},
+        "per_category": per_cat,
+        "per_category_strict": args.strict,
+        "avg_latency_ms": int(total_latency / max(1, len(cases))),
+        "per_case": per_case_rows,
+    }
+
+    RUNS_DIR.mkdir(exist_ok=True)
+    out_json = RUNS_DIR / "prompt_guard_regression.json"
+    out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"[saved] {out_json}")
+
+    REPORTS_DIR.mkdir(exist_ok=True)
+    md = [
+        "# Prompt Guard Regression — Curated Set",
+        "",
+        f"**Dataset:** `{summary['dataset']}` ({len(cases)} cases)",
+        f"**Thresholds (YAML):** short={yaml_thr['short']}, medium={yaml_thr['medium']}, "
+        f"long={yaml_thr['long']}, base={yaml_thr['semantic_threshold']}",
+        "",
+        "## Binary metrics (attack = positive)",
+        "",
+        "| positivity | precision | recall | F1 | accuracy | FPR | TP | FP | TN | FN |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        (f"| strict (block only) | {m_strict['precision']:.3f} | {m_strict['recall']:.3f} | "
+         f"{m_strict['f1']:.3f} | {m_strict['accuracy']:.3f} | {m_strict['fpr']:.3f} | "
+         f"{cm_strict['tp']} | {cm_strict['fp']} | {cm_strict['tn']} | {cm_strict['fn']} |"),
+        (f"| soft (non-allow)    | {m_soft['precision']:.3f} | {m_soft['recall']:.3f} | "
+         f"{m_soft['f1']:.3f} | {m_soft['accuracy']:.3f} | {m_soft['fpr']:.3f} | "
+         f"{cm_soft['tp']} | {cm_soft['fp']} | {cm_soft['tn']} | {cm_soft['fn']} |"),
+        "",
+        f"**Average latency:** {summary['avg_latency_ms']} ms/case",
+        "",
+        "## Per-category (positivity: "
+        + ("strict" if args.strict else "soft") + ")",
+        "",
+        "| category | n | F1 | precision | recall | FPR |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for cat, metrics in sorted(per_cat.items()):
+        md.append(
+            f"| {cat} | {int(metrics['total'])} | {metrics['f1']:.3f} | "
+            f"{metrics['precision']:.3f} | {metrics['recall']:.3f} | {metrics['fpr']:.3f} |"
+        )
+
+    out_md = REPORTS_DIR / "prompt_guard_regression.md"
+    out_md.write_text("\n".join(md), encoding="utf-8")
+    print(f"[saved] {out_md}")
+    print(f"  strict F1={m_strict['f1']:.3f}  soft F1={m_soft['f1']:.3f}  "
+          f"FPR(strict)={m_strict['fpr']:.3f}")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    if args.dataset == "regression":
+        return _run_regression_mode(args)
     benign = _load_benign()
     print(f"[prompt_guard_stability] benign={len(benign)} prompts")
     yaml_thr = _thresholds_from_yaml()

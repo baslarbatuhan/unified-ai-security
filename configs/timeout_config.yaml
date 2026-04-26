@@ -1,0 +1,51 @@
+# configs/timeout_config.yaml
+# =============================
+# Per-module timeout budgets. Consumed by the circuit breaker (Phase 1B-α)
+# and the external eval runner (Phase 1A). Exceeding a budget triggers the
+# fallback path for that module; the request path always returns.
+#
+# "standard" is the default profile used by the gateway.
+# "fast" is for dashboard demos / interactive testing.
+# "generous" is for batch eval on slow hardware (CPU-only Ollama).
+
+profiles:
+
+  standard:
+    # Per-module budgets (milliseconds).
+    modules:
+      prompt_guard:   500
+      rag_guard:    20000   # chunked analysis with qwen2.5:7b CPU-bound
+      output_agency: 2000
+      output_guard:  3000
+      fusion:         200
+    # Hard ceiling from request arrival to response. Must be >= sum of
+    # parallel module budgets + fusion, with a small safety margin.
+    total_request_ms: 25000
+    # Adapter-level timeouts for external_eval.
+    adapter:
+      api_ms:        10000
+      web_ms:        30000
+
+  fast:
+    modules:
+      prompt_guard:   300
+      rag_guard:     8000
+      output_agency: 1000
+      output_guard:  1500
+      fusion:         150
+    total_request_ms: 12000
+    adapter:
+      api_ms:         5000
+      web_ms:        15000
+
+  generous:
+    modules:
+      prompt_guard:  1000
+      rag_guard:   60000
+      output_agency: 5000
+      output_guard:  8000
+      fusion:         300
+    total_request_ms: 75000
+    adapter:
+      api_ms:        30000
+      web_ms:        90000

@@ -57,7 +57,7 @@ Health check:
 curl -s http://127.0.0.1:8000/health | python3 -m json.tool
 ```
 
-Analyze request:
+Analyze request (pre-LLM — no `model_output`):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/analyze \
@@ -68,6 +68,26 @@ curl -s -X POST http://127.0.0.1:8000/analyze \
     "session_context": {"user_id":"user_alice","role":"basic"}
   }' | python3 -m json.tool
 ```
+
+Post-LLM output screening (same JSON shape as above, plus required `model_output` — the text your app got back from the target LLM):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/analyze-output \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "What is 2+2?",
+    "model_output": "The answer is 4.",
+    "session_context": {"user_id": "user_alice", "role": "basic"}
+  }' | python3 -m json.tool
+```
+
+**Operator dashboard:** with the gateway running, start the Streamlit UI in a second terminal:
+
+```bash
+streamlit run dashboard/app.py
+```
+
+It opens at `http://127.0.0.1:8501/` (Home, Targets, Run test, Live monitor, Results, Reports, Logs). The dashboard talks to the gateway over HTTP — no shared process state.
 
 ## 6) Run Tests
 

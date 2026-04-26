@@ -39,6 +39,26 @@ class SessionContext(BaseModel):
 # ---------------------------------------------------------------------------
 # Gateway request — expanded
 # ---------------------------------------------------------------------------
+class ConfigOverrides(BaseModel):
+    """Per-request configuration overrides — what the dashboard sliders send.
+
+    Every field is optional; omitted fields fall back to the gateway's
+    YAML-loaded defaults. Overrides are applied **only for this request**;
+    the long-lived FusionEngine instance is not mutated, so concurrent
+    requests with different overrides do not interfere.
+
+    Keys for `weights` / `modules_enabled`: `prompt_guard`, `rag_guard`,
+    `output_agency`, `output_guard`. Keys for `thresholds`: `allow`,
+    `sanitize`, `block`. Keys for `override`: `critical_threshold`,
+    `critical_multiplier`, `elevated_threshold`, `elevated_multiplier`.
+    """
+
+    weights: Optional[Dict[str, float]] = None
+    thresholds: Optional[Dict[str, float]] = None
+    override: Optional[Dict[str, float]] = None
+    modules_enabled: Optional[Dict[str, bool]] = None
+
+
 class AnalyzeRequest(BaseModel):
     prompt: str = Field(..., description="User prompt text")
     retrieved_docs: Optional[List[Dict[str, Any]]] = Field(
@@ -55,6 +75,10 @@ class AnalyzeRequest(BaseModel):
         description="If tool_request is omitted, the first candidate is used by the gateway",
     )
     session_context: SessionContext = Field(default_factory=SessionContext)
+    config_overrides: Optional[ConfigOverrides] = Field(
+        default=None,
+        description="Per-request fusion config — overrides gateway defaults for this call only.",
+    )
 
     # Backward-compat aliases (read-only, not required)
     user_input: Optional[str] = Field(default=None, exclude=True)
@@ -81,6 +105,9 @@ class AnalyzeResponse(BaseModel):
     prompt_score: float = Field(default=0.0, ge=0.0, le=1.0)
     rag_score: float = Field(default=0.0, ge=0.0, le=1.0)
     agency_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Populated only by /analyze-output (post-LLM screening). The plain
+    # /analyze path never sets this — stays at 0.0 for backward compat.
+    output_score: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence: List[str] = Field(default_factory=list)
     module_risks: List[ModuleRisk] = Field(default_factory=list)
     latency_ms: Optional[int] = Field(default=None, ge=0)

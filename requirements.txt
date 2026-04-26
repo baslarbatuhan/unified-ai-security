@@ -29,5 +29,14 @@ requests>=2.28
 # Sandbox execution (Docker SDK)
 docker>=7.0
 
+# Dashboard UI (Streamlit, separate process from the gateway)
+streamlit>=1.30
+streamlit-autorefresh>=1.0
+pandas>=2.0
+plotly>=5.18
+# PDF export from the Reports page. reportlab is the lightweight fallback;
+# weasyprint+markdown gives prettier output if installed.
+reportlab>=4.0
+
 # Testing
 pytest>=7.4
