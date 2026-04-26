@@ -43,7 +43,26 @@ from schemas.risk_schema import (
     SessionContext,
     ToolRequest,
 )
+from schemas.telemetry_schema import (
+    FusionDecisionEvent,
+    ModuleResultEvent,
+    RequestEvent,
+    emit_telemetry,
+    new_run_id,
+)
 from fusion_gateway.engine import FusionEngine
+
+
+# Decisions coming out of legacy module_risks may use forms the telemetry
+# schema doesn't recognise; normalise once here so emission never raises.
+_DECISION_MAP = {
+    "allow": "allow", "sanitize": "sanitize", "flag": "flag", "block": "block",
+    "permit": "allow", "deny": "block", "warn": "flag", "review": "flag",
+}
+
+
+def _norm_decision(d: Any) -> str:
+    return _DECISION_MAP.get(str(d or "allow").lower(), "allow")
 
 
 class SecurityGateway:
@@ -73,11 +92,25 @@ class SecurityGateway:
             AnalyzeResponse with decision, per-module scores, evidence, and latency.
         """
         t0 = time.time()
+        run_id = new_run_id("api")
 
         # --- Extract fields for FusionEngine ---
         prompt = request.get_prompt()
         user_id = request.get_user_id()
         role = request.get_role()
+
+        # Telemetry — request event. Never raises (emit_telemetry swallows).
+        try:
+            emit_telemetry(RequestEvent(
+                run_id=run_id,
+                prompt=prompt,
+                prompt_char_count=len(prompt or ""),
+                has_retrieved_docs=bool(request.retrieved_docs),
+                retrieved_doc_count=len(request.retrieved_docs or []),
+                session_role=role or "basic",
+            ))
+        except Exception:
+            pass
 
         # Structured docs preferred; else public `context`, else legacy retrieved_context
         retrieved_docs = request.retrieved_docs
@@ -103,6 +136,11 @@ class SecurityGateway:
             ]
 
         # --- Run FusionEngine ---
+        overrides_dict = (
+            request.config_overrides.model_dump(exclude_none=True)
+            if getattr(request, "config_overrides", None)
+            else None
+        )
         engine_response = self.engine.analyze(
             user_input=prompt,
             retrieved_context=retrieved_context,
@@ -111,6 +149,7 @@ class SecurityGateway:
             role=role,
             user_id=user_id,
             tool_candidates=tool_candidates_dicts,
+            overrides=overrides_dict,
         )
 
         # --- Map to new AnalyzeResponse ---
@@ -147,12 +186,178 @@ class SecurityGateway:
 
         latency_ms = int((time.time() - t0) * 1000)
 
+        # Telemetry — per-module + fusion events. Guarded so a schema mismatch
+        # can't break the request path.
+        try:
+            for mr in module_risks_parsed:
+                emit_telemetry(ModuleResultEvent(
+                    run_id=run_id,
+                    module=mr.module,
+                    risk_score=max(0.0, min(1.0, float(mr.risk_score))),
+                    confidence=max(0.0, min(1.0, float(mr.confidence or 0.0))),
+                    decision=_norm_decision(mr.decision),
+                    latency_ms=int(mr.latency_ms or 0),
+                    evidence=list(mr.evidence or [])[:10],
+                ))
+            emit_telemetry(FusionDecisionEvent(
+                run_id=run_id,
+                fused_risk_score=max(0.0, min(1.0, float(engine_response.fused_risk))),
+                decision=_norm_decision(engine_response.final_decision),
+                prompt_score=float(prompt_score),
+                rag_score=float(rag_score),
+                agency_score=float(agency_score),
+                output_score=0.0,
+                evidence=list(all_evidence)[:20],
+                latency_ms_total=latency_ms,
+            ))
+        except Exception:
+            pass
+
         return AnalyzeResponse(
             decision=engine_response.final_decision,
             fused_risk_score=engine_response.fused_risk,
             prompt_score=prompt_score,
             rag_score=rag_score,
             agency_score=agency_score,
+            evidence=all_evidence,
+            module_risks=module_risks_parsed,
+            latency_ms=latency_ms,
+        )
+
+    def analyze_with_output(
+        self, request: AnalyzeRequest, model_output: str
+    ) -> AnalyzeResponse:
+        """Post-LLM analysis — runs all 4 modules including output_guard.
+
+        Intended for a 2-phase client flow:
+            1. Client calls /analyze with the user prompt, gets allow/block.
+            2. If allowed, client calls the target LLM itself, captures the
+               completion, and posts both here as `model_output`.
+
+        We re-run the 3 input-side modules because they're cheap relative to
+        the network round-trip and this keeps the endpoint stateless (no
+        session tracking required).
+        """
+        t0 = time.time()
+        run_id = new_run_id("api-out")
+
+        prompt = request.get_prompt()
+        user_id = request.get_user_id()
+        role = request.get_role()
+
+        try:
+            emit_telemetry(RequestEvent(
+                run_id=run_id,
+                prompt=prompt,
+                prompt_char_count=len(prompt or ""),
+                has_retrieved_docs=bool(request.retrieved_docs),
+                retrieved_doc_count=len(request.retrieved_docs or []),
+                session_role=role or "basic",
+            ))
+        except Exception:
+            pass
+
+        # Normalise docs / tools exactly like analyze() does.
+        retrieved_docs = request.retrieved_docs
+        retrieved_context = None
+        if not retrieved_docs:
+            if request.context:
+                retrieved_context = request.context
+            elif request.retrieved_context:
+                retrieved_context = request.retrieved_context
+
+        tr = request.tool_request
+        if tr is None and request.tool_candidates:
+            tr = request.tool_candidates[0]
+        tool_call = {"tool": tr.tool, "args": tr.params} if tr else None
+
+        tool_candidates_dicts = None
+        if request.tool_candidates:
+            tool_candidates_dicts = [
+                {"tool": t.tool, "args": t.params} for t in request.tool_candidates
+            ]
+
+        overrides_dict = (
+            request.config_overrides.model_dump(exclude_none=True)
+            if getattr(request, "config_overrides", None)
+            else None
+        )
+        engine_response = self.engine.analyze_with_output(
+            user_input=prompt,
+            model_output=model_output,
+            retrieved_context=retrieved_context,
+            retrieved_docs=retrieved_docs,
+            tool_call=tool_call,
+            role=role,
+            user_id=user_id,
+            tool_candidates=tool_candidates_dicts,
+            overrides=overrides_dict,
+        )
+
+        module_risks_parsed = []
+        prompt_score = 0.0
+        rag_score = 0.0
+        agency_score = 0.0
+        output_score = 0.0
+        all_evidence: List[str] = []
+
+        for mr in engine_response.module_risks:
+            module_name = mr.get("module", "")
+            risk_score = mr.get("risk_score", 0.0)
+            evidence = mr.get("evidence", [])
+            if module_name == "prompt_guard":
+                prompt_score = risk_score
+            elif module_name == "rag_guard":
+                rag_score = risk_score
+            elif module_name == "output_agency":
+                agency_score = risk_score
+            elif module_name == "output_guard":
+                output_score = risk_score
+            for e in evidence:
+                all_evidence.append(f"[{module_name}] {e}")
+            module_risks_parsed.append(ModuleRisk(
+                module=module_name,
+                risk_score=risk_score,
+                confidence=mr.get("confidence", 0.0),
+                decision=mr.get("decision", "allow"),
+                evidence=evidence,
+                latency_ms=mr.get("latency_ms"),
+            ))
+
+        latency_ms = int((time.time() - t0) * 1000)
+
+        try:
+            for mr in module_risks_parsed:
+                emit_telemetry(ModuleResultEvent(
+                    run_id=run_id,
+                    module=mr.module,
+                    risk_score=max(0.0, min(1.0, float(mr.risk_score))),
+                    confidence=max(0.0, min(1.0, float(mr.confidence or 0.0))),
+                    decision=_norm_decision(mr.decision),
+                    latency_ms=int(mr.latency_ms or 0),
+                    evidence=list(mr.evidence or [])[:10],
+                ))
+            emit_telemetry(FusionDecisionEvent(
+                run_id=run_id,
+                fused_risk_score=max(0.0, min(1.0, float(engine_response.fused_risk))),
+                decision=_norm_decision(engine_response.final_decision),
+                prompt_score=float(prompt_score),
+                rag_score=float(rag_score),
+                agency_score=float(agency_score),
+                output_score=float(output_score),
+                evidence=list(all_evidence)[:20],
+                latency_ms_total=latency_ms,
+            ))
+        except Exception:
+            pass
+
+        return AnalyzeResponse(
+            decision=engine_response.final_decision,
+            fused_risk_score=engine_response.fused_risk,
+            prompt_score=prompt_score,
+            rag_score=rag_score,
+            agency_score=agency_score,
+            output_score=output_score,
             evidence=all_evidence,
             module_risks=module_risks_parsed,
             latency_ms=latency_ms,

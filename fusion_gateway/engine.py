@@ -47,6 +47,12 @@ _FALLBACK_WEIGHTS = {
     "output_agency": 0.40,
     "prompt_guard": 0.30,
     "rag_guard": 0.30,
+    # Output guard is additive — 0.0 keeps legacy 3-module behaviour when the
+    # caller uses analyze(). analyze_with_output() renormalises over enabled
+    # modules, so operators who want output-side weighting can set this to
+    # e.g. 0.25 in configs/secure_balanced.yaml without breaking existing
+    # deployments that never call analyze_with_output.
+    "output_guard": 0.0,
 }
 
 _FALLBACK_THRESHOLDS = {
@@ -181,6 +187,7 @@ def _module_enabled_flags() -> Dict[str, bool]:
         "prompt_guard": bool(mods.get("prompt_guard", {}).get("enabled", True)),
         "rag_guard": bool(mods.get("rag_guard", {}).get("enabled", True)),
         "output_agency": bool(mods.get("output_agency", {}).get("enabled", True)),
+        "output_guard": bool(mods.get("output_guard", {}).get("enabled", True)),
     }
 
 
@@ -520,15 +527,59 @@ def _evaluate_agency_guard(
         )
 
 
+def _evaluate_output_guard(output_text: Optional[str]) -> ModuleRisk:
+    """Run output guard analyzer on the model's response text.
+
+    Unlike the other three modules, this one looks at what the model *said*
+    rather than what the user asked — it catches leaked PII/secrets, unsafe
+    instructions the model would smuggle back, downstream injection payloads,
+    and redirects to untrusted destinations.
+    """
+    t0 = time.time()
+    if not output_text:
+        return ModuleRisk(
+            module="output_guard", risk_score=0.0, confidence=0.90,
+            decision="allow", evidence=["No model output provided"],
+            latency_ms=0,
+        )
+    try:
+        from output_guard.output_analyzer import analyze as _og_analyze
+        result = _og_analyze(output_text)
+        return ModuleRisk(
+            module="output_guard",
+            risk_score=round(result.score, 4),
+            confidence=0.90,
+            decision=result.decision,  # type: ignore[arg-type]
+            evidence=list(result.evidence) or ["All output checks passed"],
+            latency_ms=result.latency_ms or int((time.time() - t0) * 1000),
+        )
+    except Exception as e:
+        return ModuleRisk(
+            module="output_guard", risk_score=0.0, confidence=0.5,
+            decision="allow", evidence=[f"Error: {str(e)}"],
+            latency_ms=int((time.time() - t0) * 1000),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 def _threshold_decision(score: float) -> Decision:
-    if score < DEFAULT_THRESHOLDS["allow"]:
+    return _threshold_decision_with(score, DEFAULT_THRESHOLDS)
+
+
+def _threshold_decision_with(score: float, thresholds: Dict[str, float]) -> Decision:
+    """Same banding as `_threshold_decision` but with caller-supplied
+    thresholds — used by per-request overrides so dashboard slider values
+    actually reach the decision banding."""
+    allow_t = thresholds.get("allow", DEFAULT_THRESHOLDS["allow"])
+    sanitize_t = thresholds.get("sanitize", DEFAULT_THRESHOLDS["sanitize"])
+    block_t = thresholds.get("block", DEFAULT_THRESHOLDS["block"])
+    if score < allow_t:
         return "allow"
-    elif score < DEFAULT_THRESHOLDS["sanitize"]:
+    elif score < sanitize_t:
         return "sanitize"
-    elif score >= DEFAULT_THRESHOLDS["block"]:
+    elif score >= block_t:
         return "block"
     else:
         return "flag"
@@ -571,6 +622,7 @@ class FusionEngine:
         role: str = "basic",
         user_id: str = "anonymous",
         tool_candidates: Optional[List[Dict[str, Any]]] = None,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> FusionEngineResponse:
         """
         Run all 3 modules and fuse risk scores.
@@ -589,6 +641,15 @@ class FusionEngine:
         """
         t0 = time.time()
         enabled = _module_enabled_flags()
+
+        # Per-request overrides (dashboard sliders, runner --config-yaml).
+        # Merged onto the long-lived instance state without mutating it.
+        ov = overrides or {}
+        eff_weights = {**self.weights, **(ov.get("weights") or {})}
+        eff_thresholds = {**self.thresholds, **(ov.get("thresholds") or {})}
+        eff_override_cfg = {**self.override, **(ov.get("override") or {})}
+        if ov.get("modules_enabled"):
+            enabled = {**enabled, **{k: bool(v) for k, v in ov["modules_enabled"].items()}}
 
         # Run modules (parallel or sequential)
         if self.parallel:
@@ -625,17 +686,17 @@ class FusionEngine:
         den = 0.0
         for k in keys:
             if enabled.get(k, True):
-                num += self.weights[k] * risks[k].risk_score
-                den += self.weights[k]
+                num += eff_weights.get(k, 0.0) * risks[k].risk_score
+                den += eff_weights.get(k, 0.0)
         fused = round(min(num / den, 1.0), 4) if den > 0 else 0.0
 
         # Max-rule override: if any module flags a critical threat,
         # the fused score must reflect at least that module's severity.
         # This prevents dilution when only one module detects an attack.
-        crit_th = self.override.get("critical_threshold", 0.85)
-        crit_mul = self.override.get("critical_multiplier", 0.90)
-        elev_th = self.override.get("elevated_threshold", 0.60)
-        elev_mul = self.override.get("elevated_multiplier", 0.85)
+        crit_th = eff_override_cfg.get("critical_threshold", 0.85)
+        crit_mul = eff_override_cfg.get("critical_multiplier", 0.90)
+        elev_th = eff_override_cfg.get("elevated_threshold", 0.60)
+        elev_mul = eff_override_cfg.get("elevated_multiplier", 0.85)
 
         module_max = max(prompt_risk.risk_score, rag_risk.risk_score, agency_risk.risk_score)
         if module_max >= crit_th:
@@ -645,7 +706,7 @@ class FusionEngine:
 
         fused = round(min(fused, 1.0), 4)
 
-        final_decision = _threshold_decision(fused)
+        final_decision = _threshold_decision_with(fused, eff_thresholds)
 
         total_latency = int((time.time() - t0) * 1000)
 
@@ -727,6 +788,112 @@ class FusionEngine:
     ) -> FusionEngineResponse:
         """Shortcut: evaluate prompt + RAG guard (structured docs)."""
         return self.analyze(user_input=user_input, retrieved_docs=docs)
+
+    def analyze_with_output(
+        self,
+        user_input: str,
+        model_output: str,
+        retrieved_context: Optional[str] = None,
+        retrieved_docs: Optional[List[Dict[str, Any]]] = None,
+        tool_call: Optional[Dict] = None,
+        role: str = "basic",
+        user_id: str = "anonymous",
+        tool_candidates: Optional[List[Dict[str, Any]]] = None,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> FusionEngineResponse:
+        """Run all four modules (3 input-side + output_guard) and fuse.
+
+        This is additive to `analyze(...)`: existing callers that don't have
+        the model's response yet keep using `analyze()`. Callers that proxy
+        the model round-trip (e.g. the external_eval runner after it receives
+        the target's answer) call this to include output-side checks.
+
+        The fused score renormalises over modules whose weight is > 0 AND
+        which are enabled in config — so output_guard only contributes to
+        the fused_risk when operators explicitly give it a weight.
+        """
+        t0 = time.time()
+        enabled = _module_enabled_flags()
+        ov = overrides or {}
+        eff_weights = {**self.weights, **(ov.get("weights") or {})}
+        eff_thresholds = {**self.thresholds, **(ov.get("thresholds") or {})}
+        eff_override_cfg = {**self.override, **(ov.get("override") or {})}
+        if ov.get("modules_enabled"):
+            enabled = {**enabled, **{k: bool(v) for k, v in ov["modules_enabled"].items()}}
+
+        # Run the 3 input-side modules via the existing analyze() path so we
+        # don't duplicate parallel/sequential logic. Its fused_risk field is
+        # ignored here — we rebuild the fusion with the 4-module weight set.
+        input_side = self.analyze(
+            user_input=user_input,
+            retrieved_context=retrieved_context,
+            retrieved_docs=retrieved_docs,
+            tool_call=tool_call,
+            role=role,
+            user_id=user_id,
+            tool_candidates=tool_candidates,
+            overrides=overrides,
+        )
+
+        # Output guard — gated by config flag.
+        if enabled.get("output_guard", True):
+            og_risk = _evaluate_output_guard(model_output)
+        else:
+            og_risk = _disabled_module_risk("output_guard")
+
+        # Pull per-module risks back out of the dicts that analyze() emitted.
+        by_name = {m["module"]: m for m in input_side.module_risks}
+        prompt_d = by_name.get("prompt_guard", {})
+        rag_d = by_name.get("rag_guard", {})
+        agency_d = by_name.get("output_agency", {})
+
+        # 4-way weighted sum over enabled, non-zero-weighted modules.
+        keys = ("prompt_guard", "rag_guard", "output_agency", "output_guard")
+        scores = {
+            "prompt_guard": float(prompt_d.get("risk_score", 0.0)),
+            "rag_guard": float(rag_d.get("risk_score", 0.0)),
+            "output_agency": float(agency_d.get("risk_score", 0.0)),
+            "output_guard": og_risk.risk_score,
+        }
+        num = 0.0
+        den = 0.0
+        for k in keys:
+            w = float(eff_weights.get(k, 0.0))
+            if enabled.get(k, True) and w > 0:
+                num += w * scores[k]
+                den += w
+        fused = round(min(num / den, 1.0), 4) if den > 0 else 0.0
+
+        # Max-rule override over all four modules.
+        crit_th = eff_override_cfg.get("critical_threshold", 0.85)
+        crit_mul = eff_override_cfg.get("critical_multiplier", 0.90)
+        elev_th = eff_override_cfg.get("elevated_threshold", 0.60)
+        elev_mul = eff_override_cfg.get("elevated_multiplier", 0.85)
+        module_max = max(scores.values())
+        if module_max >= crit_th:
+            fused = max(fused, module_max * crit_mul)
+        elif module_max >= elev_th:
+            fused = max(fused, module_max * elev_mul)
+        fused = round(min(fused, 1.0), 4)
+
+        final_decision = _threshold_decision_with(fused, eff_thresholds)
+        total_latency = int((time.time() - t0) * 1000)
+
+        module_risks = list(input_side.module_risks) + [{
+            "module": "output_guard",
+            "risk_score": og_risk.risk_score,
+            "confidence": og_risk.confidence,
+            "decision": og_risk.decision,
+            "evidence": og_risk.evidence,
+            "latency_ms": og_risk.latency_ms,
+        }]
+
+        return FusionEngineResponse(
+            final_decision=final_decision,
+            fused_risk=fused,
+            module_risks=module_risks,
+            latency_ms=total_latency,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,83 @@
+# configs/alert_rules.yaml
+# =========================
+# Declarative alert rules evaluated by monitoring/alert_rules.py.
+#
+# Each rule is a predicate over a metrics snapshot (flat dict of numbers).
+# Supported operators: gt, gte, lt, lte, eq.
+#   Multiple (metric, op, threshold) clauses in `when:` are ANDed.
+# Severity levels: info, warn, critical. Used for dashboard colouring and
+# for filtering which alerts page which channel downstream.
+#
+# Metric names produced by monitoring.alert_rules.build_snapshot_from_events:
+#   total_requests, block_rate, sanitize_rate, allow_rate,
+#   error_rate, p95_latency_ms, avg_latency_ms,
+#   attack_bypass_rate,  # fusion said allow for a blockable attack
+#   module_<name>_error_rate, module_<name>_avg_latency_ms,
+#   circuit_<name>_open, circuit_<name>_short_circuits,
+#   rate_limit_reject_rate.
+
+rules:
+  - id: high_error_rate
+    severity: critical
+    message: "Gateway error rate {error_rate:.1%} exceeds 5% SLO"
+    when:
+      - metric: error_rate
+        op: gt
+        threshold: 0.05
+      - metric: total_requests
+        op: gte
+        threshold: 20  # don't alert on tiny samples
+
+  - id: elevated_bypass_rate
+    severity: critical
+    message: "Attack bypass rate {attack_bypass_rate:.1%} — ≥1 in 10 malicious prompts scored allow"
+    when:
+      - metric: attack_bypass_rate
+        op: gt
+        threshold: 0.10
+      - metric: total_requests
+        op: gte
+        threshold: 20
+
+  - id: p95_latency_regression
+    severity: warn
+    message: "P95 latency {p95_latency_ms:.0f}ms over 2000ms budget"
+    when:
+      - metric: p95_latency_ms
+        op: gt
+        threshold: 2000
+
+  - id: low_traffic_block_spike
+    severity: warn
+    message: "Block rate {block_rate:.1%} above 40% — possible false-positive spike"
+    when:
+      - metric: block_rate
+        op: gt
+        threshold: 0.40
+      - metric: total_requests
+        op: gte
+        threshold: 20
+
+  - id: rag_guard_errors
+    severity: warn
+    message: "RAG guard error rate {module_rag_guard_error_rate:.1%} > 10%"
+    when:
+      - metric: module_rag_guard_error_rate
+        op: gt
+        threshold: 0.10
+
+  - id: llm_judge_breaker_open
+    severity: critical
+    message: "LLM judge circuit breaker is open — RAG guard degraded"
+    when:
+      - metric: circuit_llm_judge_open
+        op: gte
+        threshold: 1
+
+  - id: rate_limit_flood
+    severity: warn
+    message: "Rate-limit reject rate {rate_limit_reject_rate:.1%} > 15%"
+    when:
+      - metric: rate_limit_reject_rate
+        op: gt
+        threshold: 0.15

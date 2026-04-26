@@ -1,0 +1,51 @@
+# configs/service_limits.yaml
+# =============================
+# SLA / safety ceilings for the gateway. Unlike timeout_config.yaml (which
+# tunes per-request behaviour), this file expresses hard limits the system
+# must not cross — enforced by rate_limiter.py (Phase 1B-α.1) and the
+# output_guard payload-size check.
+
+rate_limit:
+  # Default tier applied when no per-user policy exists.
+  default:
+    requests_per_minute: 60
+    burst: 10
+    # window_seconds + burst_multiplier derive the token-bucket capacity.
+    window_seconds: 60
+    burst_multiplier: 1.5
+
+  # Per-target overrides for external_eval traffic. A single noisy test run
+  # should not DoS a live chatbot — the runner respects these.
+  external_eval:
+    requests_per_minute: 30
+    burst: 5
+    window_seconds: 60
+    burst_multiplier: 1.2
+
+  # Admin / dashboard endpoints — generous (management, not traffic).
+  admin:
+    requests_per_minute: 300
+    burst: 50
+    window_seconds: 60
+    burst_multiplier: 2.0
+
+payload:
+  # Request-body byte caps. Exceeding → 413.
+  max_prompt_bytes: 32768
+  max_context_bytes: 65536
+  # Response / output guard ceilings. Exceeding → truncate with evidence flag.
+  max_response_bytes: 131072
+
+concurrency:
+  # Max in-flight requests per worker. Above this → 503.
+  max_concurrent_requests_per_worker: 32
+  # External eval runner parallelism (per-target).
+  external_eval_parallel: 4
+
+circuit_breaker:
+  # Consecutive failures to open the breaker. Applies to every module call.
+  failure_threshold: 3
+  # Seconds to wait before attempting half-open probe.
+  open_cooldown_seconds: 30
+  # Successes needed while half-open to fully close.
+  half_open_success_threshold: 2

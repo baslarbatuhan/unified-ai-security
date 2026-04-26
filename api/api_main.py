@@ -43,6 +43,7 @@ from api.health import get_health_report
 from schemas.risk_schema import (
     AnalyzeRequest as SchemaRequest,
     AnalyzeResponse as SchemaResponse,
+    ConfigOverrides,
     ToolRequest,
     SessionContext,
 )
@@ -65,6 +66,10 @@ class AnalyzeRequestModel(BaseModel):
     tool_request: Optional[Dict[str, Any]] = None
     tool_candidates: Optional[List[Dict[str, Any]]] = None
     session_context: Optional[Dict[str, Any]] = None
+    # Per-request overrides (dashboard sliders, runner --config-yaml).
+    # Free-form dict so we don't make the legacy schema brittle; it is
+    # validated by `ConfigOverrides` before reaching the engine.
+    config_overrides: Optional[Dict[str, Any]] = None
 
 
 class AnalyzeResponseModel(BaseModel):
@@ -73,9 +78,15 @@ class AnalyzeResponseModel(BaseModel):
     prompt_score: float = 0.0
     rag_score: float = 0.0
     agency_score: float = 0.0
+    output_score: float = 0.0  # Populated by /analyze-output; 0.0 from /analyze.
     evidence: List[str] = []
     module_risks: List[Dict[str, Any]]
     latency_ms: int
+
+
+class AnalyzeWithOutputRequestModel(AnalyzeRequestModel):
+    """Same shape as /analyze plus the model completion to be screened."""
+    model_output: str = Field(..., description="Raw text returned by the target LLM.")
 
 
 class HealthResponse(BaseModel):
@@ -94,6 +105,28 @@ app = FastAPI(
     description="3 modül (prompt_guard, rag_guard, output_agency) → fusion → karar",
     version="2.0.0",
 )
+
+# Middleware — rate limiter sits in front of every route except /health.
+# Wiring happens before routers are mounted so all of /dashboard/* is covered.
+from api.middleware import RateLimitMiddleware  # noqa: E402
+app.add_middleware(RateLimitMiddleware)
+
+# Dashboard read-only routes (summary/alerts/recent-runs/breakers/metrics).
+from api.dashboard_routes import router as dashboard_router  # noqa: E402
+app.include_router(dashboard_router)
+
+# Run-history, reports inventory, external-eval targets — separate routers
+# so each surface stays small and testable on its own.
+from api.routes_runs import router as runs_router  # noqa: E402
+from api.routes_reports import router as reports_router  # noqa: E402
+from api.routes_targets import router as targets_router  # noqa: E402
+app.include_router(runs_router)
+app.include_router(reports_router)
+app.include_router(targets_router)
+
+# Dashboard UI is a separate Streamlit process (`streamlit run dashboard/app.py`).
+# It consumes this gateway's read-only routes (/dashboard/*, /runs, /reports,
+# /targets) over HTTP — no static asset mount lives here.
 
 engine = FusionEngine()
 gateway = SecurityGateway(engine)
@@ -192,6 +225,11 @@ async def analyze(request: AnalyzeRequestModel):
         elif request.retrieved_context:
             retrieved_docs = [{"doc_id": "ctx_0", "content": request.retrieved_context}]
 
+    overrides_typed = (
+        ConfigOverrides.model_validate(request.config_overrides)
+        if request.config_overrides
+        else None
+    )
     schema_request = SchemaRequest(
         prompt=prompt,
         retrieved_docs=retrieved_docs,
@@ -199,6 +237,7 @@ async def analyze(request: AnalyzeRequestModel):
         tool_request=tool_req,
         tool_candidates=tool_candidates_typed,
         session_context=session,
+        config_overrides=overrides_typed,
     )
 
     response = gateway.analyze(schema_request)
@@ -209,6 +248,79 @@ async def analyze(request: AnalyzeRequestModel):
         "prompt_score": response.prompt_score,
         "rag_score": response.rag_score,
         "agency_score": response.agency_score,
+        "output_score": response.output_score,
+        "evidence": response.evidence,
+        "module_risks": [mr.model_dump() for mr in response.module_risks],
+        "latency_ms": response.latency_ms or 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /analyze-output — post-LLM screening (includes output_guard)
+# ---------------------------------------------------------------------------
+@app.post("/analyze-output", response_model=AnalyzeResponseModel)
+async def analyze_output(request: AnalyzeWithOutputRequestModel):
+    """Two-phase flow: call the LLM yourself, post the completion here.
+
+    We re-run the 3 input-side modules and layer output_guard on top. Useful
+    when you want post-hoc safety checks (PII leakage, downstream injection,
+    unsafe instructions) on what the target chatbot actually produced.
+    """
+    # Reuse the SchemaRequest construction from /analyze via a direct pass.
+    prompt = request.prompt or request.user_input or ""
+
+    if request.session_context:
+        session = SessionContext(**request.session_context)
+    else:
+        session = SessionContext(user_id=request.user_id, role=request.role)
+
+    tool_req = None
+    if request.tool_request:
+        tool_req = ToolRequest(**request.tool_request)
+    elif request.tool_candidates:
+        tool_req = ToolRequest(**request.tool_candidates[0])
+    elif request.tool_call:
+        tool_req = ToolRequest(
+            tool=request.tool_call.get("tool", ""),
+            params=request.tool_call.get("args", {}),
+        )
+
+    tool_candidates_typed = None
+    if request.tool_candidates:
+        tool_candidates_typed = [ToolRequest(**t) for t in request.tool_candidates]
+
+    retrieved_docs = request.retrieved_docs
+    plain_context = None
+    if retrieved_docs is None:
+        if request.context:
+            plain_context = request.context
+        elif request.retrieved_context:
+            retrieved_docs = [{"doc_id": "ctx_0", "content": request.retrieved_context}]
+
+    overrides_typed = (
+        ConfigOverrides.model_validate(request.config_overrides)
+        if request.config_overrides
+        else None
+    )
+    schema_request = SchemaRequest(
+        prompt=prompt,
+        retrieved_docs=retrieved_docs,
+        context=plain_context,
+        tool_request=tool_req,
+        tool_candidates=tool_candidates_typed,
+        session_context=session,
+        config_overrides=overrides_typed,
+    )
+
+    response = gateway.analyze_with_output(schema_request, model_output=request.model_output)
+
+    return {
+        "final_decision": response.decision,
+        "fused_risk": response.fused_risk_score,
+        "prompt_score": response.prompt_score,
+        "rag_score": response.rag_score,
+        "agency_score": response.agency_score,
+        "output_score": response.output_score,
         "evidence": response.evidence,
         "module_risks": [mr.model_dump() for mr in response.module_risks],
         "latency_ms": response.latency_ms or 0,
