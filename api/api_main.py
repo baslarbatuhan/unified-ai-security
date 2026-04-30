@@ -33,6 +33,8 @@ try:
 except ImportError:
     pass
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
@@ -100,44 +102,15 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # App + Engine
 # ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Unified AI Security Gateway",
-    description="3 modül (prompt_guard, rag_guard, output_agency) → fusion → karar",
-    version="2.0.0",
-)
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Startup: security self-check + model warmup. Shutdown: nothing yet.
 
-# Middleware — rate limiter sits in front of every route except /health.
-# Wiring happens before routers are mounted so all of /dashboard/* is covered.
-from api.middleware import RateLimitMiddleware  # noqa: E402
-app.add_middleware(RateLimitMiddleware)
-
-# Dashboard read-only routes (summary/alerts/recent-runs/breakers/metrics).
-from api.dashboard_routes import router as dashboard_router  # noqa: E402
-app.include_router(dashboard_router)
-
-# Run-history, reports inventory, external-eval targets — separate routers
-# so each surface stays small and testable on its own.
-from api.routes_runs import router as runs_router  # noqa: E402
-from api.routes_reports import router as reports_router  # noqa: E402
-from api.routes_targets import router as targets_router  # noqa: E402
-app.include_router(runs_router)
-app.include_router(reports_router)
-app.include_router(targets_router)
-
-# Dashboard UI is a separate Streamlit process (`streamlit run dashboard/app.py`).
-# It consumes this gateway's read-only routes (/dashboard/*, /runs, /reports,
-# /targets) over HTTP — no static asset mount lives here.
-
-engine = FusionEngine()
-gateway = SecurityGateway(engine)
-
-
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def startup():
-    """Run security self-check on startup."""
+    Replaces the deprecated `@app.on_event("startup")` hook. Body is the
+    same code that lived in `startup()` previously; the `yield`
+    boundary is the only structural change FastAPI requires.
+    """
+    # ── Startup ────────────────────────────────────────────────────────
     try:
         from api.security_selfcheck import run_startup_check
         from output_agency_defense.resource_registry import create_demo_registry
@@ -173,6 +146,49 @@ async def startup():
         warmup()
     except Exception as e:
         print(f"[API] Warmup failed (non-critical): {e}")
+
+    yield
+    # ── Shutdown ───────────────────────────────────────────────────────
+    # No teardown required today — circuit breakers and embeddings are
+    # garbage-collected with the process. Add cleanup here if we ever
+    # acquire long-lived resources (DB pools, websocket subscriptions).
+
+
+app = FastAPI(
+    title="Unified AI Security Gateway",
+    description="3 modül (prompt_guard, rag_guard, output_agency) → fusion → karar",
+    version="2.0.0",
+    lifespan=_lifespan,
+)
+
+# Middleware — rate limiter sits in front of every route except /health.
+# Wiring happens before routers are mounted so all of /dashboard/* is covered.
+from api.middleware import RateLimitMiddleware  # noqa: E402
+app.add_middleware(RateLimitMiddleware)
+
+# Dashboard read-only routes (summary/alerts/recent-runs/breakers/metrics).
+from api.dashboard_routes import router as dashboard_router  # noqa: E402
+app.include_router(dashboard_router)
+
+# Run-history, reports inventory, external-eval targets — separate routers
+# so each surface stays small and testable on its own.
+from api.routes_runs import router as runs_router  # noqa: E402
+from api.routes_reports import router as reports_router  # noqa: E402
+from api.routes_targets import router as targets_router  # noqa: E402
+app.include_router(runs_router)
+app.include_router(reports_router)
+app.include_router(targets_router)
+
+# Dashboard UI is a separate Streamlit process (`streamlit run dashboard/app.py`).
+# It consumes this gateway's read-only routes (/dashboard/*, /runs, /reports,
+# /targets) over HTTP — no static asset mount lives here.
+
+engine = FusionEngine()
+gateway = SecurityGateway(engine)
+
+
+# Startup logic moved into the `_lifespan` async-context above (lifespan
+# replaces the deprecated `@app.on_event("startup")` hook in FastAPI ≥ 0.110).
 
 
 # ---------------------------------------------------------------------------

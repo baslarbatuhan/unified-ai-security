@@ -60,7 +60,7 @@ _RUNS_DIR = _PROJECT_ROOT / "runs"
 #  PART 1: BehaviorMonitor tests (signal-level)
 # ===================================================================
 
-def test_normal_user(m: BehaviorMonitor) -> Dict:
+def _run_normal_user(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     events = [
         {"user_id": "alice", "tool": "get_order", "resource_id": "ORD-001",
@@ -75,7 +75,7 @@ def test_normal_user(m: BehaviorMonitor) -> Dict:
     return _row("normal_user", r, ok, "Risk 0 for clean calls")
 
 
-def test_burst(m: BehaviorMonitor) -> Dict:
+def _run_burst(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     events = [
         {"user_id": "b", "tool": "get_order",
@@ -89,7 +89,7 @@ def test_burst(m: BehaviorMonitor) -> Dict:
                 f"burst_score={r.burst_score:.3f}")
 
 
-def test_diversity(m: BehaviorMonitor) -> Dict:
+def _run_diversity(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     events = [
         {"user_id": "d", "tool": "get_order",
@@ -103,7 +103,7 @@ def test_diversity(m: BehaviorMonitor) -> Dict:
                 f"diversity_score={r.diversity_score:.3f}")
 
 
-def test_repetition(m: BehaviorMonitor) -> Dict:
+def _run_repetition(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     events = [
         {"user_id": "rp", "tool": "get_order", "resource_id": "ORD-001",
@@ -116,7 +116,7 @@ def test_repetition(m: BehaviorMonitor) -> Dict:
                 f"repetition_score={r.repetition_score:.3f}")
 
 
-def test_failed_auth(m: BehaviorMonitor) -> Dict:
+def _run_failed_auth(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     events = [
         {"user_id": "fa", "tool": "get_order",
@@ -131,7 +131,7 @@ def test_failed_auth(m: BehaviorMonitor) -> Dict:
                 f"failed={r.failed_auth_count}")
 
 
-def test_lateral(m: BehaviorMonitor) -> Dict:
+def _run_lateral(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     types = [
         ("get_order", "ORD-1", "order"),
@@ -151,7 +151,7 @@ def test_lateral(m: BehaviorMonitor) -> Dict:
                 f"types={r.unique_resource_types}")
 
 
-def test_escalation(m: BehaviorMonitor) -> Dict:
+def _run_escalation(m: BehaviorMonitor) -> Dict:
     """10 mixed requests — risk must rise monotonically."""
     m.reset_all()
     history = []
@@ -169,7 +169,7 @@ def test_escalation(m: BehaviorMonitor) -> Dict:
                 f"Monotonic={monotonic}, curve={[round(h, 3) for h in history]}")
 
 
-def test_combined(m: BehaviorMonitor) -> Dict:
+def _run_combined(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     types = ["order", "ticket", "identity", "config"]
     r = None
@@ -182,7 +182,7 @@ def test_combined(m: BehaviorMonitor) -> Dict:
                 f"{len(r.signals)} signals, risk={r.risk_score:.3f}")
 
 
-def test_window_expiry(_m: BehaviorMonitor) -> Dict:
+def _run_window_expiry(_m: BehaviorMonitor) -> Dict:
     short = BehaviorMonitor(window_seconds=1, failed_auth_threshold=3)
     for i in range(5):
         short.record("exp", "get_order", f"ORD-{i}", "order", False)
@@ -194,7 +194,7 @@ def test_window_expiry(_m: BehaviorMonitor) -> Dict:
                        f"before={before:.3f}, after={after:.3f}")
 
 
-def test_reset(m: BehaviorMonitor) -> Dict:
+def _run_reset(m: BehaviorMonitor) -> Dict:
     m.reset_all()
     for i in range(6):
         m.record("rst", "get_order", f"ORD-{i}", "order", False)
@@ -226,7 +226,7 @@ def _make_model() -> BehaviorRiskModel:
     return BehaviorRiskModel(mon, eg, pv)
 
 
-def test_model_normal() -> Dict:
+def _run_model_normal() -> Dict:
     mdl = _make_model()
     for rid in ["ORD-001", "ORD-003"]:
         r = mdl.assess("alice", "get_order", rid,
@@ -235,7 +235,7 @@ def test_model_normal() -> Dict:
     return _row_model("model_normal", r, ok, "Clean calls → allow")
 
 
-def test_model_enum() -> Dict:
+def _run_model_enum() -> Dict:
     mdl = _make_model()
     for i in range(1001, 1006):
         r = mdl.assess("atk", "get_order", f"ORD-{i}",
@@ -245,7 +245,7 @@ def test_model_enum() -> Dict:
                       f"enum={r.enum_detected}, risk={r.risk_score:.3f}")
 
 
-def test_model_bad_params() -> Dict:
+def _run_model_bad_params() -> Dict:
     mdl = _make_model()
     r = mdl.assess("atk", "get_order", "ORD-001",
                     {"resource_id": "ORD-001'; DROP TABLE;--"},
@@ -255,7 +255,7 @@ def test_model_bad_params() -> Dict:
                       f"valid={r.param_valid}, risk={r.risk_score:.3f}")
 
 
-def test_model_combined() -> Dict:
+def _run_model_combined() -> Dict:
     mdl = _make_model()
     types = ["order", "ticket", "identity", "config"]
     for i in range(12):
@@ -270,7 +270,7 @@ def test_model_combined() -> Dict:
                       f"signals={r.behavior_signals}")
 
 
-def test_model_format() -> Dict:
+def _run_model_format() -> Dict:
     mdl = _make_model()
     r = mdl.assess("alice", "get_order", "ORD-001",
                     {"resource_id": "ORD-001"}, resource_type="order")
@@ -354,22 +354,22 @@ def run_all_tests() -> Dict:
 
     tests = [
         # Part 1: BehaviorMonitor
-        ("Normal user",         lambda: test_normal_user(monitor)),
-        ("Burst detection",     lambda: test_burst(monitor)),
-        ("Resource diversity",  lambda: test_diversity(monitor)),
-        ("Tool repetition",     lambda: test_repetition(monitor)),
-        ("Failed auth",         lambda: test_failed_auth(monitor)),
-        ("Lateral movement",    lambda: test_lateral(monitor)),
-        ("Risk escalation",     lambda: test_escalation(monitor)),
-        ("Combined attack",     lambda: test_combined(monitor)),
-        ("Window expiry",       lambda: test_window_expiry(monitor)),
-        ("Reset",               lambda: test_reset(monitor)),
+        ("Normal user",         lambda: _run_normal_user(monitor)),
+        ("Burst detection",     lambda: _run_burst(monitor)),
+        ("Resource diversity",  lambda: _run_diversity(monitor)),
+        ("Tool repetition",     lambda: _run_repetition(monitor)),
+        ("Failed auth",         lambda: _run_failed_auth(monitor)),
+        ("Lateral movement",    lambda: _run_lateral(monitor)),
+        ("Risk escalation",     lambda: _run_escalation(monitor)),
+        ("Combined attack",     lambda: _run_combined(monitor)),
+        ("Window expiry",       lambda: _run_window_expiry(monitor)),
+        ("Reset",               lambda: _run_reset(monitor)),
         # Part 2: BehaviorRiskModel
-        ("Model: normal",       test_model_normal),
-        ("Model: enumeration",  test_model_enum),
-        ("Model: bad params",   test_model_bad_params),
-        ("Model: combined",     test_model_combined),
-        ("Model: format",       test_model_format),
+        ("Model: normal",       _run_model_normal),
+        ("Model: enumeration",  _run_model_enum),
+        ("Model: bad params",   _run_model_bad_params),
+        ("Model: combined",     _run_model_combined),
+        ("Model: format",       _run_model_format),
     ]
 
     results = []
@@ -441,6 +441,89 @@ def run_all_tests() -> Dict:
     print(f"  [Saved] {summary_path}")
 
     return summary
+
+
+# ===================================================================
+#  pytest entry points — thin wrappers around the `_run_*` helpers.
+#  Pytest 9 warns (and Pytest 10 will error) when test functions
+#  return non-None, so the helpers above keep their dict returns for
+#  the script-mode CSV pipeline while these wrappers translate to
+#  plain `assert` for the test runner.
+# ===================================================================
+
+def test_normal_user(m: BehaviorMonitor) -> None:
+    row = _run_normal_user(m)
+    assert row["passed"], row["note"]
+
+
+def test_burst(m: BehaviorMonitor) -> None:
+    row = _run_burst(m)
+    assert row["passed"], row["note"]
+
+
+def test_diversity(m: BehaviorMonitor) -> None:
+    row = _run_diversity(m)
+    assert row["passed"], row["note"]
+
+
+def test_repetition(m: BehaviorMonitor) -> None:
+    row = _run_repetition(m)
+    assert row["passed"], row["note"]
+
+
+def test_failed_auth(m: BehaviorMonitor) -> None:
+    row = _run_failed_auth(m)
+    assert row["passed"], row["note"]
+
+
+def test_lateral(m: BehaviorMonitor) -> None:
+    row = _run_lateral(m)
+    assert row["passed"], row["note"]
+
+
+def test_escalation(m: BehaviorMonitor) -> None:
+    row = _run_escalation(m)
+    assert row["passed"], row["note"]
+
+
+def test_combined(m: BehaviorMonitor) -> None:
+    row = _run_combined(m)
+    assert row["passed"], row["note"]
+
+
+def test_window_expiry(m: BehaviorMonitor) -> None:
+    row = _run_window_expiry(m)
+    assert row["passed"], row["note"]
+
+
+def test_reset(m: BehaviorMonitor) -> None:
+    row = _run_reset(m)
+    assert row["passed"], row["note"]
+
+
+def test_model_normal() -> None:
+    row = _run_model_normal()
+    assert row["passed"], row["note"]
+
+
+def test_model_enum() -> None:
+    row = _run_model_enum()
+    assert row["passed"], row["note"]
+
+
+def test_model_bad_params() -> None:
+    row = _run_model_bad_params()
+    assert row["passed"], row["note"]
+
+
+def test_model_combined() -> None:
+    row = _run_model_combined()
+    assert row["passed"], row["note"]
+
+
+def test_model_format() -> None:
+    row = _run_model_format()
+    assert row["passed"], row["note"]
 
 
 if __name__ == "__main__":

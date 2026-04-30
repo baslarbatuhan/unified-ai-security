@@ -144,39 +144,74 @@ def build_agency_attacks() -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Gateway caller (HTTP only)
+# Gateway caller (HTTP only) — rate-limit-aware
 # ---------------------------------------------------------------------------
-def call_gateway(request: Dict, base_url: str = "http://localhost:8000") -> Dict:
-    """Send request to gateway via HTTP POST /analyze."""
+def call_gateway(
+    request: Dict,
+    base_url: str = "http://localhost:8000",
+    *,
+    max_retries: int = 3,
+) -> Dict:
+    """Send POST /analyze to the gateway, retrying on 429 with backoff.
+
+    The gateway's `RateLimitMiddleware` (configs/service_limits.yaml,
+    default 60 RPM / 10 burst) returns 429 with a `Retry-After` header
+    when a token-bucket runs dry. Earlier the runner mapped 429 onto
+    `decision="error"` and moved on — so a single warmed-up attack
+    suite (147 cases) appeared to "fail" 130/147 cases and corrupted
+    the gateway_attack_results.csv → baseline_comparison pipeline.
+
+    We now respect Retry-After (capped at 30 s) and retry up to
+    `max_retries` times before falling back to `error`.
+    """
     import requests as req
-    try:
-        resp = req.post(f"{base_url}/analyze", json=request, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
-    except req.exceptions.HTTPError as e:
-        return {
-            "decision": "error",
-            "fused_risk_score": 0.0,
-            "prompt_score": 0.0,
-            "rag_score": 0.0,
-            "agency_score": 0.0,
-            "evidence": [f"HTTP {resp.status_code}: {resp.text[:200]}"],
-            "module_risks": [],
-            "latency_ms": 0,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {
-            "decision": "error",
-            "fused_risk_score": 0.0,
-            "prompt_score": 0.0,
-            "rag_score": 0.0,
-            "agency_score": 0.0,
-            "evidence": [str(e)],
-            "module_risks": [],
-            "latency_ms": 0,
-            "error": str(e),
-        }
+    delay = 1.0
+    for attempt in range(max_retries + 1):
+        try:
+            resp = req.post(f"{base_url}/analyze", json=request, timeout=60)
+            if resp.status_code == 429 and attempt < max_retries:
+                ra = resp.headers.get("Retry-After")
+                wait = min(float(ra), 30.0) if ra else delay
+                time.sleep(wait)
+                delay = min(delay * 2, 30.0)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except req.exceptions.HTTPError as e:
+            return {
+                "decision": "error",
+                "fused_risk_score": 0.0,
+                "prompt_score": 0.0,
+                "rag_score": 0.0,
+                "agency_score": 0.0,
+                "evidence": [f"HTTP {resp.status_code}: {resp.text[:200]}"],
+                "module_risks": [],
+                "latency_ms": 0,
+                "error": str(e),
+            }
+        except Exception as e:
+            return {
+                "decision": "error",
+                "fused_risk_score": 0.0,
+                "prompt_score": 0.0,
+                "rag_score": 0.0,
+                "agency_score": 0.0,
+                "evidence": [str(e)],
+                "module_risks": [],
+                "latency_ms": 0,
+                "error": str(e),
+            }
+    return {
+        "decision": "error",
+        "fused_risk_score": 0.0,
+        "prompt_score": 0.0,
+        "rag_score": 0.0,
+        "agency_score": 0.0,
+        "evidence": [f"exceeded {max_retries} retries on 429"],
+        "module_risks": [],
+        "latency_ms": 0,
+        "error": "rate_limited",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -245,16 +280,27 @@ def parse_result(attack: Dict, response: Dict) -> Dict:
 # ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
-def run_attack_suite(base_url: str = "http://localhost:8000", seed: int = 42) -> Dict:
-    """Run all attack datasets through the HTTP gateway."""
+def run_attack_suite(
+    base_url: str = "http://localhost:8000",
+    seed: int = 42,
+    rps: float = 1.0,
+) -> Dict:
+    """Run all attack datasets through the HTTP gateway.
 
+    `rps` (requests per second) paces the runner so it doesn't trip the
+    gateway's RateLimitMiddleware (default 60 RPM / 10 burst). 1.0 RPS
+    matches the default tier exactly; lower for slower hardware, raise
+    only if you've widened service_limits.yaml.
+    """
     # Set seed for reproducibility
     random.seed(seed)
+    min_interval = 1.0 / rps if rps > 0 else 0.0
 
     print(f"\n{'='*65}")
     print(f"  ATTACK SUITE RUNNER (HTTP)")
     print(f"  Gateway: {base_url}")
     print(f"  Seed: {seed}")
+    print(f"  Pacing: {rps} req/s ({min_interval*1000:.0f} ms gap)")
     print(f"{'='*65}")
 
     # Build all attacks
@@ -283,7 +329,16 @@ def run_attack_suite(base_url: str = "http://localhost:8000", seed: int = 42) ->
     results = []
 
     print(f"\n  Running attacks...")
+    last_call_at = 0.0
     for i, attack in enumerate(all_attacks):
+        # Throttle to stay under the gateway's rate limit. Sleep is
+        # measured from the *start* of the previous request so genuinely
+        # slow gateway responses naturally absorb the gap.
+        gap = (last_call_at + min_interval) - time.time()
+        if gap > 0:
+            time.sleep(gap)
+        last_call_at = time.time()
+
         t0 = time.time()
         response = call_gateway(attack["request"], base_url)
         elapsed = int((time.time() - t0) * 1000)
@@ -365,6 +420,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run attack suite through HTTP gateway")
     parser.add_argument("--url", default="http://localhost:8000", help="Gateway URL")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--rps", type=float, default=1.0,
+        help=(
+            "Pacing: requests per second sent to the gateway. Default 1.0 "
+            "matches the default RateLimitMiddleware tier (60 RPM). Lower "
+            "for slow hardware; raise only after widening service_limits.yaml."
+        ),
+    )
     args = parser.parse_args()
 
-    run_attack_suite(base_url=args.url, seed=args.seed)
+    run_attack_suite(base_url=args.url, seed=args.seed, rps=args.rps)

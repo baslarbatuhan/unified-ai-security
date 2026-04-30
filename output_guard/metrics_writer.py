@@ -41,11 +41,32 @@ _LOCK = Lock()
 
 
 def _ensure_writer(path: Path, fields: list[str]):
+    """Append-mode writer with schema-drift protection.
+
+    If the existing file's first line doesn't match `fields`, the file
+    is rotated aside (`.stale-<utc>`) and started fresh — this prevents
+    silent corruption when an older release (or an eval script with a
+    different schema) wrote to the same path. Caller already holds
+    `_LOCK` so the rename is race-safe.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    new_file = not path.exists()
+    expected_header = ",".join(fields)
+    needs_init = not path.exists()
+    if not needs_init:
+        try:
+            with path.open("r", encoding="utf-8") as rf:
+                actual_header = (rf.readline() or "").rstrip("\r\n")
+            if actual_header != expected_header:
+                from datetime import datetime, timezone
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                rotated = path.with_suffix(path.suffix + f".stale-{stamp}")
+                path.rename(rotated)
+                needs_init = True
+        except OSError:
+            needs_init = True
     f = path.open("a", newline="", encoding="utf-8")
     w = csv.DictWriter(f, fieldnames=fields)
-    if new_file:
+    if needs_init:
         w.writeheader()
     return f, w
 

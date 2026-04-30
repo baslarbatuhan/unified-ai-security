@@ -64,14 +64,20 @@ from utils.log_sanitizer import (
 DEFAULT_THRESHOLDS = {"allow": 0.30, "sanitize": 0.60, "block": 0.85}
 
 # Weights for signal → aggregate score.  Summed with clipping in [0,1].
-# Calibrated so any ONE strong signal (e.g. confirmed API key) already lands
-# in the sanitize/block band; two independent PII hits reach block.
+#
+# Calibration target (with default thresholds allow<0.30, sanitize<0.60,
+# block≥0.85): any ONE confirmed signal must reach at least the sanitize
+# band — single-leak scenarios were silently allowed in the Hafta 4
+# eval (5/12 accuracy). Two independent strong signals must reach block.
+#
+# Validation set: `datasets/output_guard_eval_set.json` —
+# `evaluation/run_output_guard_batch.py` reports per-category recall.
 DEFAULT_WEIGHTS = {
-    "pii":                   0.35,
-    "api_key":               0.75,
-    "unsafe_instruction":    0.55,
-    "downstream_injection":  0.60,
-    "redirect_to_unknown":   0.30,
+    "pii":                   0.60,   # was 0.35 — single PII hit lands ON sanitize floor (0.60)
+    "api_key":               0.90,   # was 0.75 — provider key alone now blocks
+    "unsafe_instruction":    0.65,   # was 0.55 — `rm -rf /` / `curl|sh` sanitizes
+    "downstream_injection":  0.60,   # unchanged — already at sanitize floor
+    "redirect_to_unknown":   0.60,   # was 0.30 — off-allowlist URL lands ON sanitize floor
 }
 
 # Domains that are treated as safe to reference.  Intentionally short —
@@ -93,8 +99,11 @@ DEFAULT_ALLOWLIST_DOMAINS = {
 # Unsafe-instruction heuristics. Kept tight to avoid flagging ordinary prose.
 _UNSAFE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("rm_rf",        re.compile(r"\brm\s+-[rfRF]{1,3}\s+(?:/|~|\$HOME)\S*", re.IGNORECASE)),
-    ("curl_pipe_sh", re.compile(r"\bcurl\s+[^|]+\|\s*(?:sh|bash|zsh)\b", re.IGNORECASE)),
-    ("wget_pipe_sh", re.compile(r"\bwget\s+[^|]+\|\s*(?:sh|bash|zsh)\b", re.IGNORECASE)),
+    # `| sh`, `| bash`, `| sudo bash`, `| sudo -E sh` — the optional `sudo`
+    # prefix was missing previously, so `curl … | sudo bash` (the most
+    # common dangerous form) slipped through into the redirect-only path.
+    ("curl_pipe_sh", re.compile(r"\bcurl\s+[^|]+\|\s*(?:sudo\s+(?:-\w+\s+)?)?(?:sh|bash|zsh)\b", re.IGNORECASE)),
+    ("wget_pipe_sh", re.compile(r"\bwget\s+[^|]+\|\s*(?:sudo\s+(?:-\w+\s+)?)?(?:sh|bash|zsh)\b", re.IGNORECASE)),
     ("chmod_777",    re.compile(r"\bchmod\s+(?:-R\s+)?(?:777|a\+rwx)\b", re.IGNORECASE)),
     ("disable_sec",  re.compile(r"\bdisable\s+(?:the\s+)?(?:firewall|selinux|apparmor|tls|ssl|cert\w*)\b", re.IGNORECASE)),
     ("privileged",   re.compile(r"--privileged\b|--cap-add=ALL\b", re.IGNORECASE)),
@@ -103,11 +112,18 @@ _UNSAFE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
 ]
 
 _DOWNSTREAM_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
-    ("ignore_previous", re.compile(r"\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|above|earlier|prior)\b", re.IGNORECASE)),
+    # Use lookbehind `(?<![A-Za-z0-9])` instead of `\b` — `\b` fails when the
+    # injection sits next to a letter-like escape sequence (e.g. literal
+    # `\n\nIgnore previous` where `n` and `I` are both word-chars and `\b`
+    # would not fire). Hafta 4 eval `downstream_injection_basic` triggered
+    # this — replacing `\b` with a tighter lookbehind on the *front* keeps
+    # benign matches conservative while letting newline-prefixed injections
+    # through.
+    ("ignore_previous", re.compile(r"(?<![A-Za-z0-9])(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|above|earlier|prior)\b", re.IGNORECASE)),
     ("role_switch",     re.compile(r"\b(?:system|assistant|developer)\s*:\s", re.IGNORECASE)),
     ("inst_tag",        re.compile(r"\[\[?\s*INST\s*\]?\]|\[/INST\]|<\|system\|>|<\|im_start\|>", re.IGNORECASE)),
-    ("new_persona",     re.compile(r"\byou\s+are\s+now\s+(?:a\s+)?(?:different|new|unrestricted|dan)\b", re.IGNORECASE)),
-    ("override_policy", re.compile(r"\boverride\s+(?:your|the)\s+(?:safety|policy|rules|guidelines)\b", re.IGNORECASE)),
+    ("new_persona",     re.compile(r"(?<![A-Za-z0-9])you\s+are\s+now\s+(?:a\s+)?(?:different|new|unrestricted|dan)\b", re.IGNORECASE)),
+    ("override_policy", re.compile(r"(?<![A-Za-z0-9])override\s+(?:your|the)\s+(?:safety|policy|rules|guidelines)\b", re.IGNORECASE)),
 ]
 
 # URL matcher — simple but captures the host reliably.
@@ -276,11 +292,21 @@ def _check_downstream_injection(text: str) -> Dict[str, Any]:
 
 
 def _check_redirect(text: str, *, allowlist_domains: set[str]) -> Dict[str, Any]:
+    # Allowlist may carry either registrable domains (`mozilla.org`) or
+    # specific subdomains (`developer.mozilla.org`). Match against both:
+    # the exact host first, then the 2-label registrable fall-back. This
+    # also tolerates a subdomain operator listed in the allowlist
+    # without forcing them to also list the apex domain.
+    norm_allow = {d.lower().rstrip(".") for d in allowlist_domains}
     unknown: List[str] = []
     for m in _RE_URL.finditer(text):
-        host = m.group(1)
+        host = m.group(1).lower().rstrip(".")
         reg = _registrable_domain(host)
-        if reg in allowlist_domains:
+        if host in norm_allow or reg in norm_allow:
+            continue
+        # Subdomain-of-allowed: `docs.developer.mozilla.org` should match
+        # an allowlist entry of `developer.mozilla.org` or `mozilla.org`.
+        if any(host.endswith("." + d) for d in norm_allow):
             continue
         unknown.append(host)
     # dedupe, preserve order

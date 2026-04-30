@@ -56,11 +56,35 @@ _LOCK = Lock()
 
 
 def _ensure_writer(path: Path, fields: List[str]):
+    """Open an append-mode CSV writer with schema-drift protection.
+
+    Append mode silently corrupts the file when the on-disk header
+    doesn't match `fields` (older schemas from previous releases, or
+    eval scripts that wrote here by mistake). We detect that by reading
+    the existing first line; if it doesn't match, the file is rotated
+    aside (`.stale-<utc>`) and started fresh. Race-safe under `_LOCK`,
+    which every caller already holds.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    new_file = not path.exists()
+    expected_header = ",".join(fields)
+    needs_init = not path.exists()
+    if not needs_init:
+        try:
+            with path.open("r", encoding="utf-8") as rf:
+                actual_header = (rf.readline() or "").rstrip("\r\n")
+            if actual_header != expected_header:
+                # Preserve old data for forensics, restart file with new schema.
+                from datetime import datetime, timezone
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                rotated = path.with_suffix(path.suffix + f".stale-{stamp}")
+                path.rename(rotated)
+                needs_init = True
+        except OSError:
+            # Unreadable existing file → restart conservatively.
+            needs_init = True
     f = path.open("a", newline="", encoding="utf-8")
     w = csv.DictWriter(f, fieldnames=fields)
-    if new_file:
+    if needs_init:
         w.writeheader()
     return f, w
 
@@ -117,7 +141,13 @@ def record_run(
     risk_score = float(risk_dict.get("risk_score", 0.0))
     evidence: List[str] = list(risk_dict.get("evidence", []))
 
-    # Route counters across every doc
+    # Route counters across every doc.
+    # Three fill paths, in priority order:
+    #   1. Caller passed a real per-doc ChunkRouter trace.
+    #   2. The pipeline ran chunked-analysis and produced `chunk_breakdown`
+    #      JSON on each suspicious doc — synthesise a RouteDecision per chunk
+    #      so the counters reflect actual chunk-level work, not doc-level.
+    #   3. Doc-level fallback: one virtual chunk per suspicious doc.
     counts = {"skip": 0, "fast_judge": 0, "deep_judge": 0, "overrides": 0}
     if per_doc_routes:
         for decisions in per_doc_routes.values():
@@ -125,6 +155,25 @@ def record_run(
                 counts[d.route.value] += 1
                 if d.used_override:
                     counts["overrides"] += 1
+    else:
+        for doc in result.doc_scores:
+            chunk_breakdown = getattr(doc, "chunk_scores", None) or []
+            if chunk_breakdown:
+                # Real chunked analysis ran — bucket each chunk by its
+                # judge_score against the same thresholds ChunkRouter uses.
+                for c in chunk_breakdown:
+                    js = float(c.get("judge_score", 0.0))
+                    if js >= 0.55:
+                        counts["deep_judge"] += 1
+                    elif js >= 0.15:
+                        counts["fast_judge"] += 1
+                    else:
+                        counts["skip"] += 1
+            elif doc.is_suspicious:
+                # Doc-level fallback (no chunked analysis) — count as one
+                # deep_judge so route_overrides flag the override path.
+                counts["deep_judge"] += 1
+                counts["overrides"] += 1
 
     # Top doc = highest combined score
     top_doc: Optional[CombinedDocScore] = None
