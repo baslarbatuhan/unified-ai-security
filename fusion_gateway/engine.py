@@ -324,8 +324,19 @@ def _evaluate_rag_guard(
     retrieved_docs: Optional[List[Dict[str, Any]]] = None,
     retrieved_context: Optional[str] = None,
     user_query: str = "general query",
+    *,
+    live_run_id: str = "live",
+    live_case_id: str = "",
+    live_target_id: str = "",
 ) -> ModuleRisk:
-    """Run RAG guard pipeline (embedding → LLM judge → combine → filter)."""
+    """Run RAG guard pipeline (embedding → LLM judge → combine → filter).
+
+    On a successful pipeline run we also append one row to
+    `runs/rag_final_metrics.csv` and N rows to
+    `runs/rag_explainability_log.csv` via `rag_guard.metrics_writer`.
+    Writer failures are swallowed — the gateway response path must never
+    break because telemetry persistence hit a disk error.
+    """
     t0 = time.time()
 
     # Build document list from either structured docs or legacy string
@@ -345,6 +356,19 @@ def _evaluate_rag_guard(
         pipeline = _get_rag_pipeline()
         result = pipeline.run(documents, user_query=user_query)
         risk_dict = result.to_module_risk_dict()
+
+        # Live telemetry → rag_final_metrics.csv + rag_explainability_log.csv.
+        # Wrapped so a writer crash never blocks the gateway response.
+        try:
+            from rag_guard.metrics_writer import record_run as _rag_record
+            _rag_record(
+                result,
+                run_id=live_run_id,
+                case_id=live_case_id,
+                target_id=live_target_id,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must be best-effort
+            pass
 
         # On block/sanitize decisions, log which chunk triggered the worst
         # judge score so auditors can trace the decision back to a specific
@@ -527,13 +551,25 @@ def _evaluate_agency_guard(
         )
 
 
-def _evaluate_output_guard(output_text: Optional[str]) -> ModuleRisk:
+def _evaluate_output_guard(
+    output_text: Optional[str],
+    *,
+    live_run_id: str = "live",
+    live_case_id: str = "",
+    live_target_id: str = "",
+) -> ModuleRisk:
     """Run output guard analyzer on the model's response text.
 
     Unlike the other three modules, this one looks at what the model *said*
     rather than what the user asked — it catches leaked PII/secrets, unsafe
     instructions the model would smuggle back, downstream injection payloads,
     and redirects to untrusted destinations.
+
+    On a successful analysis we also append one row to
+    `runs/output_security_metrics.csv` and N rows to
+    `runs/output_explainability_log.csv` via `output_guard.metrics_writer`.
+    Writer failures are swallowed so a disk error can't break the
+    gateway response path.
     """
     t0 = time.time()
     if not output_text:
@@ -545,6 +581,19 @@ def _evaluate_output_guard(output_text: Optional[str]) -> ModuleRisk:
     try:
         from output_guard.output_analyzer import analyze as _og_analyze
         result = _og_analyze(output_text)
+
+        # Live telemetry → output_security_metrics.csv + output_explainability_log.csv.
+        try:
+            from output_guard.metrics_writer import record_result as _og_record
+            _og_record(
+                result,
+                run_id=live_run_id,
+                case_id=live_case_id,
+                target_id=live_target_id,
+            )
+        except Exception:  # noqa: BLE001 — telemetry must be best-effort
+            pass
+
         return ModuleRisk(
             module="output_guard",
             risk_score=round(result.score, 4),
