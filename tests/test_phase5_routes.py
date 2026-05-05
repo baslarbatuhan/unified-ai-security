@@ -343,3 +343,150 @@ def test_status_404_for_unknown_run(tmp_path, monkeypatch):
     client = TestClient(app)
     r = client.get("/runs/no-such-run/status")
     assert r.status_code == 404
+
+
+# ===========================================================================
+# POST /targets/test — connection-probe contract
+# ===========================================================================
+def test_targets_test_mock_succeeds(targets_client):
+    """Mock target probe is in-process and always succeeds."""
+    client, _ = targets_client
+    body = client.post("/targets/test", json={
+        "target": {
+            "id": "tmp_mock",
+            "name": "tmp",
+            "type": "mock",
+            "timeout_seconds": 5.0,
+        },
+        "probe_prompt": "Merhaba",
+    }).json()
+    assert body["ok"] is True
+    assert body["category"] == ""
+    assert "Merhaba" in body["response_sample"]
+    assert body["latency_ms"] >= 0
+    assert body["metadata"]["mock"] is True
+
+
+def test_targets_test_schema_invalid_returns_ok_false(targets_client):
+    """Pydantic field error → ok=false / category=schema, NOT 422."""
+    client, _ = targets_client
+    body = client.post("/targets/test", json={
+        "target": {
+            # Missing `name` → schema validation will fail
+            "id": "broken",
+            "type": "api",
+            "endpoint": "http://example.test",
+        },
+    }).json()
+    assert body["ok"] is False
+    assert body["category"] == "schema"
+    assert body["error_message"]
+
+
+def test_targets_test_get_without_query_template_is_schema(targets_client):
+    """Sprint-9 validator: api+GET without query_template → schema fail."""
+    client, _ = targets_client
+    body = client.post("/targets/test", json={
+        "target": {
+            "id": "tmp_get",
+            "name": "Tmp GET",
+            "type": "api",
+            "endpoint": "http://example.test",
+            "http_method": "GET",
+            # query_template missing
+        },
+    }).json()
+    assert body["ok"] is False
+    assert body["category"] == "schema"
+
+
+def test_targets_test_api_get_uses_get_method(targets_client, monkeypatch):
+    """Patch APIAdapter._get_client to inject a MockTransport so we
+    don't actually hit the network. Verifies the route + adapter wire
+    GET requests with query parameters end-to-end."""
+    import httpx
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        return httpx.Response(200, text="echo", headers={"content-type": "text/plain"})
+
+    # Patch APIAdapter to use a MockTransport so the probe never hits the network.
+    from external_eval import api_adapter as aa
+
+    real_get_client = aa.APIAdapter._get_client
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                timeout=self.target.timeout_seconds,
+            )
+        return self._client
+
+    monkeypatch.setattr(aa.APIAdapter, "_get_client", fake_get_client)
+
+    client, _ = targets_client
+    body = client.post("/targets/test", json={
+        "target": {
+            "id": "tmp_get_real",
+            "name": "GET probe",
+            "type": "api",
+            "endpoint": "http://example.test/chat",
+            "http_method": "GET",
+            "query_template": {"message": "{prompt}"},
+            "timeout_seconds": 5.0,
+        },
+        "probe_prompt": "ping",
+    }).json()
+
+    assert body["ok"] is True, body
+    assert captured["method"] == "GET"
+    assert "message=ping" in captured["url"]
+    assert body["response_sample"] == "echo"
+    assert body["metadata"]["http_method"] == "GET"
+
+
+def test_targets_test_api_transport_error_categorised(targets_client, monkeypatch):
+    """5xx response → category=transport, ok=false, with HTTP details."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream unavailable")
+
+    from external_eval import api_adapter as aa
+
+    def fake_get_client(self):
+        if self._client is None:
+            self._client = httpx.Client(
+                transport=httpx.MockTransport(handler),
+                timeout=self.target.timeout_seconds,
+            )
+        return self._client
+
+    monkeypatch.setattr(aa.APIAdapter, "_get_client", fake_get_client)
+
+    client, _ = targets_client
+    body = client.post("/targets/test", json={
+        "target": {
+            "id": "tmp_5xx",
+            "name": "5xx target",
+            "type": "api",
+            "endpoint": "http://example.test/chat",
+            "http_method": "POST",
+            "timeout_seconds": 5.0,
+        },
+    }).json()
+
+    assert body["ok"] is False
+    assert body["category"] == "transport"
+    assert "503" in body["error_message"]
+
+
+def test_targets_test_missing_target_field_returns_422(targets_client):
+    """Body must contain `target` — runner shouldn't crash on garbage."""
+    client, _ = targets_client
+    r = client.post("/targets/test", json={"probe_prompt": "hi"})
+    assert r.status_code == 422

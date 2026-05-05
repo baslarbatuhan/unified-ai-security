@@ -32,6 +32,19 @@ Rate limiting is applied in `api/middleware.py` (applies to dashboard routes as 
 
 `external_eval/run_external_eval.py` produces `runs/external_eval_results.csv` with a `gateway_miss` column: it flags when the **expected** decision is `block` or `sanitize` but the gateway returned `allow`. This is a **protector** metric, not the same as RAG retrieval “attack success rate” (ASR) in `rag_guard/rag_baseline.py`.
 
+### Target adapter axis
+
+`schemas/target_schema.py::TargetConfig` has three `type` values, each backed by an adapter in `external_eval/`:
+
+| `type` | Adapter | Required fields | Optional fields |
+|---|---|---|---|
+| `api` (POST) | `APIAdapter` | `endpoint` | `request_template` (JSON body w/ `{prompt}`), `response_path`, `auth` |
+| `api` (GET) | `APIAdapter` | `endpoint`, `query_template` | `response_path`, `auth` |
+| `web` | `WebAdapter` (Playwright) | `endpoint`, `selectors.input`, `selectors.response` | `selectors.submit`, `selectors.response_wait_ms`, fallbacks |
+| `mock` | `MockAdapter` | (none) | `metadata` |
+
+The `api` type uses `http_method: "POST" \| "GET"` (default `POST`) to switch between body-style and query-style requests. POST uses `request_template`; GET uses `query_template` (flat dict, values may contain `{prompt}` and `{role}`). Plain-text responses are returned as-is when `response_path` is blank and `Content-Type` is not JSON; setting `response_path` on a non-JSON endpoint raises `AdapterError` so the misconfiguration is loud, not silent.
+
 ## Explainability — two parallel pipelines
 
 Per-decision evidence is written by two independent producers that **must

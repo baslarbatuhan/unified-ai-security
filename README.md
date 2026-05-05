@@ -85,6 +85,36 @@ unified-ai-security/
 
 ## Quick Start
 
+### Option A — Docker (recommended, no host setup)
+
+`docker compose up` brings the whole stack online with the same surface
+as a local run: gateway on `:8000`, dashboard on `:8501`, plus Chroma
+and Ollama for RAG/judge. State (target YAML, generated CSVs) is
+bind-mounted to the host so it survives container restarts.
+
+```bash
+git clone https://github.com/<user>/unified-ai-security.git
+cd unified-ai-security/infra
+cp .env.example .env          # fill in HF_TOKEN / API keys if you have them
+docker compose up -d
+# gateway   → http://localhost:8000
+# dashboard → http://localhost:8501
+docker compose logs -f gateway   # warmup takes ~60-90 s on first boot
+```
+
+GPU (NVIDIA host with the Container Toolkit):
+
+```bash
+docker compose -f docker-compose.yml \
+               -f docker-compose.override.yml \
+               -f docker-compose.gpu.yml up -d
+```
+
+Stop with `docker compose down` (`-v` also drops the chroma/ollama
+volumes; omit if you want the LLM weights to survive).
+
+### Option B — Local Python venv
+
 ```bash
 git clone https://github.com/<user>/unified-ai-security.git
 cd unified-ai-security
