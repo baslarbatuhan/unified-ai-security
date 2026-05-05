@@ -7,6 +7,7 @@ targets:
   timeout_seconds: 5.0
   has_tools: false
   auth: {}
+  http_method: POST
   metadata:
     description: Echoes the prompt back with a safe prefix. For dev + CI.
 - id: internal_chatbot_api
@@ -19,6 +20,7 @@ targets:
   auth:
     type: bearer
     token_env: CHATBOT_BEARER_TOKEN
+  http_method: POST
   request_template:
     messages:
     - role: user
@@ -37,6 +39,7 @@ targets:
   timeout_seconds: 45.0
   has_tools: false
   auth: {}
+  http_method: POST
   selectors:
     input: textarea[data-testid=chat-input]
     submit: button[data-testid=chat-send]
@@ -49,3 +52,16 @@ targets:
     response_wait_ms: 4000
   metadata:
     notes: Update selectors when the UI revs.
+- id: chatbot_n4b
+  name: N4B Chatbot
+  type: api
+  enabled: true
+  endpoint: http://10.147.10.22:9993/chat/n4bchatbot
+  timeout_seconds: 30.0
+  has_tools: false
+  auth: {}
+  http_method: POST
+  request_template:
+    message: '{prompt}'
+  response_path: result.answer
+  metadata: {}

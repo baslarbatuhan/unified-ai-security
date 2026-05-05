@@ -119,6 +119,28 @@ class APIAdapter(ChatbotAdapter):
 
         return _walk(tpl)
 
+    def _render_query(self, prompt: str, session_context: Dict[str, Any]) -> Dict[str, str]:
+        """Render `query_template` for GET-style targets.
+
+        httpx.Client.get(params=...) accepts a flat {str: str} dict and
+        URL-encodes values automatically. We only walk one level deep —
+        nested dicts are intentionally rejected because URL query
+        strings are flat. Use POST + request_template if you need a
+        nested payload.
+        """
+        tpl = self.target.query_template or {}
+        if not isinstance(tpl, dict):
+            raise AdapterConfigError(
+                f"target {self.target.id!r}: query_template must be a flat dict"
+            )
+        role = str(session_context.get("role", "user"))
+        rendered: Dict[str, str] = {}
+        for k, v in tpl.items():
+            sv = str(v)
+            sv = sv.replace("{prompt}", prompt).replace("{role}", role)
+            rendered[str(k)] = sv
+        return rendered
+
     @staticmethod
     def _extract_response(data: Any, path: Optional[str]) -> str:
         if not path:
@@ -167,32 +189,74 @@ class APIAdapter(ChatbotAdapter):
         self, prompt: str, session_context: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
         url = self.target.endpoint or ""
-        headers = {"Content-Type": "application/json", **self._auth_headers()}
-        body = self._render_template(prompt, session_context)
+        method = (getattr(self.target, "http_method", "POST") or "POST").upper()
+        headers = self._auth_headers()
         client = self._get_client()
 
         try:
-            resp = client.post(url, headers=headers, json=body)
+            if method == "GET":
+                params = self._render_query(prompt, session_context)
+                # Pre-flight URL length sanity check — query strings get
+                # truncated by gateways/CDNs around 2-4 KB. Surface this
+                # as a config error (not a transport error) so the runner
+                # can attribute the failure to the prompt size, not the
+                # network.
+                approx_len = len(url) + sum(len(k) + len(v) + 2 for k, v in params.items())
+                if approx_len > 4096:
+                    raise AdapterTransportError(
+                        f"GET {url}: request URL would be ~{approx_len} bytes "
+                        "(>4096); switch to POST + request_template."
+                    )
+                resp = client.get(url, headers=headers, params=params)
+            else:  # POST default — backward compatible
+                headers["Content-Type"] = "application/json"
+                body = self._render_template(prompt, session_context)
+                resp = client.post(url, headers=headers, json=body)
         except httpx.TimeoutException as exc:
-            raise AdapterTimeout(f"POST {url} timed out after {self.target.timeout_seconds}s") from exc
+            raise AdapterTimeout(
+                f"{method} {url} timed out after {self.target.timeout_seconds}s"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise AdapterTransportError(f"POST {url} transport error: {exc}") from exc
+            raise AdapterTransportError(f"{method} {url} transport error: {exc}") from exc
 
         if resp.status_code >= 400:
             raise AdapterTransportError(
-                f"POST {url} returned HTTP {resp.status_code}: {resp.text[:200]}"
+                f"{method} {url} returned HTTP {resp.status_code}: {resp.text[:200]}"
             )
 
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise AdapterTransportError(f"POST {url} non-JSON body: {exc}") from exc
+        # Content-type aware response handling — chatbots that respond
+        # in plain text (e.g. simple GET endpoints) shouldn't be forced
+        # through `resp.json()`. JSON path still tried first when
+        # Content-Type advertises JSON.
+        ctype = (resp.headers.get("content-type") or "").lower()
+        is_json = "application/json" in ctype or ctype.startswith("application/")
+        if is_json:
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise AdapterTransportError(
+                    f"{method} {url} advertised JSON but body unparseable: {exc}"
+                ) from exc
+            text = self._extract_response(data, self.target.response_path)
+        else:
+            # Plain text / unknown content-type — return body as-is. If
+            # the operator set response_path on a non-JSON endpoint, that
+            # is a config mistake; surface it loudly rather than silently
+            # ignoring.
+            if self.target.response_path:
+                raise AdapterError(
+                    f"{method} {url}: response_path={self.target.response_path!r} "
+                    f"set but Content-Type is {ctype!r} (not JSON). "
+                    "Clear response_path for plain-text endpoints."
+                )
+            text = resp.text
 
-        text = self._extract_response(data, self.target.response_path)
         metadata = {
             "status_code": resp.status_code,
+            "http_method": method,
             "response_path": self.target.response_path,
             "response_bytes": len(resp.content),
+            "content_type": ctype,
         }
         return text, metadata
 

@@ -81,18 +81,36 @@ class TargetConfig(BaseModel):
     auth: Dict[str, Any] = Field(default_factory=dict)
 
     # API-only
+    http_method: Literal["POST", "GET"] = Field(
+        default="POST",
+        description=(
+            "HTTP method for `api` targets. POST sends `request_template` "
+            "as a JSON body; GET sends `query_template` as a URL-encoded "
+            "query string. (Web/mock targets ignore this.)"
+        ),
+    )
     request_template: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Optional request body template for api targets. Use {prompt} "
-            "placeholder. Example: {'messages':[{'role':'user','content':'{prompt}'}]}"
+            "Optional request body template for POST-style api targets. "
+            "Use {prompt} placeholder. Example: "
+            "{'messages':[{'role':'user','content':'{prompt}'}]}"
+        ),
+    )
+    query_template: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional query-string template for GET-style api targets. "
+            "Values may contain {prompt} placeholder. Example: "
+            "{'message': '{prompt}'} → ?message=<encoded-prompt>"
         ),
     )
     response_path: Optional[str] = Field(
         default=None,
         description=(
             "Dot-path into the JSON response that holds the assistant text. "
-            "Example: 'choices.0.message.content'"
+            "Example: 'choices.0.message.content'. Leave blank for plain-text "
+            "responses or to let the adapter try common shapes."
         ),
     )
 
@@ -108,6 +126,14 @@ class TargetConfig(BaseModel):
         if self.type == "api":
             if not self.endpoint:
                 raise ValueError(f"target {self.id!r}: api targets require `endpoint`.")
+            # GET-style requires query_template — otherwise the adapter
+            # has nothing to render and would always send an empty query.
+            if self.http_method == "GET" and not self.query_template:
+                raise ValueError(
+                    f"target {self.id!r}: api+GET requires `query_template` "
+                    "(e.g. {'message': '{prompt}'}). Use POST if you want "
+                    "to send a JSON body via `request_template` instead."
+                )
         elif self.type == "web":
             if not self.endpoint:
                 raise ValueError(f"target {self.id!r}: web targets require `endpoint` (page URL).")

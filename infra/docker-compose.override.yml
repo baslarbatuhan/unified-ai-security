@@ -1,18 +1,32 @@
 # Dev-only overlay — auto-loaded by `docker compose up`.
 #
-# Mounts host source tree into the gateway container so edits take effect
-# on restart without rebuilding the image. Skip this file for reproducible
-# experiment runs:
+# Mounts host source tree into the gateway + dashboard containers so edits
+# take effect on restart without rebuilding the image. Skip this file for
+# reproducible experiment runs:
 #
 #   docker compose -f docker-compose.yml up        # image code only
 #   docker compose up                              # image + this override
 #
+# Adding a new top-level package? Add it to BOTH services so dev-mode
+# parity holds (gateway + dashboard share the image).
 services:
   gateway:
     volumes:
-      - ../rag_guard:/app/rag_guard:ro
-      - ../prompt_guard:/app/prompt_guard:ro
-      - ../output_agency_defense:/app/output_agency_defense:ro
-      - ../fusion_gateway:/app/fusion_gateway:ro
       - ../api:/app/api:ro
+      - ../fusion_gateway:/app/fusion_gateway:ro
+      - ../prompt_guard:/app/prompt_guard:ro
+      - ../rag_guard:/app/rag_guard:ro
+      - ../output_agency_defense:/app/output_agency_defense:ro
+      - ../output_guard:/app/output_guard:ro
+      - ../external_eval:/app/external_eval:ro
       - ../evaluation:/app/evaluation:ro
+      - ../schemas:/app/schemas:ro
+      - ../monitoring:/app/monitoring:ro
+      - ../reporting:/app/reporting:ro
+      - ../utils:/app/utils:ro
+
+  dashboard:
+    volumes:
+      - ../dashboard:/app/dashboard:ro
+      - ../schemas:/app/schemas:ro
+      - ../utils:/app/utils:ro

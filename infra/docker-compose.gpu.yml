@@ -1,0 +1,25 @@
+# Opt-in NVIDIA GPU overlay for the ollama service.
+#
+# Layer this file ON TOP of docker-compose.yml when the host has an
+# NVIDIA GPU and the NVIDIA Container Toolkit installed:
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.override.yml \
+#     -f docker-compose.gpu.yml \
+#     up
+#
+# Skip this file on CPU-only hosts — the base compose works there with
+# slower (but functional) CPU inference.
+services:
+  ollama:
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

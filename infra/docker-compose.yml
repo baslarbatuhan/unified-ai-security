@@ -1,10 +1,28 @@
-# Host Ollama often uses 11434; map compose Ollama to 11435 on the host to avoid bind conflicts.
+# Unified AI Security Gateway — Docker compose
+# ────────────────────────────────────────────────────────────────────
+# Goal: parity with the local dev experience —
+#   `docker compose up` should give you exactly what you'd get by
+#   running `uvicorn …` and `streamlit run …` side-by-side on the host:
+#     - gateway   → http://localhost:8000
+#     - dashboard → http://localhost:8501
+#     - chroma    → :8001 (host) / :8000 (in-network)
+#     - ollama    → :11435 (host) / :11434 (in-network) — optional
 #
-# GPU: Only Ollama uses GPU for LLM inference. Gateway runs BGE-M3 embeddings on CPU
-#      so that Ollama gets full VRAM. Requires NVIDIA Container Toolkit on host.
+# Profiles
+# --------
+#   (default)  → gateway + dashboard + chroma + ollama (CPU)
+#   gpu        → adds nvidia runtime to ollama (requires NVIDIA Container Toolkit)
+#                Use:  docker compose --profile gpu up
+#   no-ollama  → opt out of compose's ollama (e.g. when a host Ollama is already
+#                running on :11434). Override OLLAMA_HOST then.
 #
-# HF_TOKEN: put `HF_TOKEN=hf_...` in infra/.env (see .env.example) so the gateway container
-# can authenticate to Hugging Face Hub (higher rate limits, no unauthenticated warning).
+# Env file
+# --------
+# `infra/.env` (see infra/.env.example). Keys consumed here:
+#   HF_TOKEN              — Hugging Face Hub auth (BGE-M3 download speed)
+#   OPENAI_API_KEY        — passed to gateway for OpenAI-style targets
+#   ANTHROPIC_API_KEY     — passed to gateway for Anthropic-style targets
+#   GATEWAY_URL           — only honoured by the dashboard; defaults to in-network
 services:
   gateway:
     build:
@@ -12,6 +30,7 @@ services:
       dockerfile: Dockerfile
       args:
         TORCH_DEVICE: cpu
+    container_name: uais-gateway
     ports:
       - "8000:8000"
     environment:
@@ -23,6 +42,11 @@ services:
       # Same secret; both names are read by huggingface_hub / transformers
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # Target-side credential passthrough — used by APIAdapter when a user
+      # configures `auth.token_env=OPENAI_API_KEY` (etc.) on a target.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CHATBOT_BEARER_TOKEN=${CHATBOT_BEARER_TOKEN:-}
     volumes:
       - hf_cache:/app/.cache/huggingface
       - gateway_logs:/app/logs
@@ -32,6 +56,12 @@ services:
       #   docker compose -f docker-compose.yml up
       # which ignores the override and runs image-built code only.
       - ../configs:/app/configs:ro
+      # State that the user expects to survive container restarts:
+      #   - `runs/` accumulates CSVs, status.json files, runner logs
+      #   - `external_eval/targets.yaml` is edited via the dashboard CRUD
+      #     and must round-trip across `docker compose down/up`.
+      - ../runs:/app/runs
+      - ../external_eval/targets.yaml:/app/external_eval/targets.yaml
     depends_on:
       chroma:
         condition: service_started
@@ -42,29 +72,69 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
+    restart: unless-stopped
+
+  # Streamlit dashboard — same image as the gateway (both in requirements.txt),
+  # different command + different port. Talks to the gateway over the internal
+  # docker network (`gateway:8000`); the host only sees :8501.
+  dashboard:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        TORCH_DEVICE: cpu
+    container_name: uais-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      # In-network gateway URL — overridden via `infra/.env` if you want
+      # the dashboard to talk to a host-side gateway instead.
+      - GATEWAY_URL=${GATEWAY_URL:-http://gateway:8000}
+      - GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-120}
+    command:
+      - streamlit
+      - run
+      - dashboard/app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    depends_on:
+      - gateway
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   chroma:
     image: chromadb/chroma:latest
+    container_name: uais-chroma
     ports:
       - "8001:8000"
     volumes:
       - chroma_data:/chroma/chroma
     restart: unless-stopped
 
+  # Ollama runs **CPU-only** by default so this compose works on every
+  # machine, including laptops without an NVIDIA GPU. The official
+  # ollama/ollama image falls back to CPU inference when no GPU device
+  # is exposed — slower (~10× for a 7B model) but functional.
+  #
+  # To enable GPU acceleration, layer the GPU override on top:
+  #     docker compose \
+  #       -f docker-compose.yml \
+  #       -f docker-compose.override.yml \
+  #       -f docker-compose.gpu.yml \
+  #       up
+  # That file adds `runtime: nvidia` + the device reservation. Requires
+  # the NVIDIA Container Toolkit on the host.
   ollama:
     image: ollama/ollama:latest
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    container_name: uais-ollama
     ports:
       - "11435:11434"
     volumes:
@@ -73,11 +143,13 @@ services:
 
   # Sandbox container for isolated tool execution
   sandbox:
+    profiles: ["sandbox"]
     build:
       context: ..
       dockerfile: Dockerfile
       args:
         TORCH_DEVICE: cpu
+    container_name: uais-sandbox
     entrypoint: ["python", "-c", "import time; time.sleep(999999)"]
     network_mode: "none"
     read_only: true
