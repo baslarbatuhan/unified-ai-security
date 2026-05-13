@@ -40,6 +40,13 @@ _METRICS_FIELDS = [
     "judge_available", "model_used",
     "latency_ms",
     "route_skip", "route_fast_judge", "route_deep_judge", "route_overrides",
+    # Hafta 12.2: routing cost telemetry. `total_chunks_evaluated` makes
+    # the dashboard's Performance tab math reproducible without summing
+    # the explainability log; `routing_savings_pct` quantifies "how many
+    # LLM calls did the router avoid"; the two `*_phase_ms` columns
+    # split end-to-end latency_ms into embedding vs judge time.
+    "total_chunks_evaluated", "total_llm_judge_calls", "routing_savings_pct",
+    "embedding_phase_ms", "judge_phase_ms",
     "top_doc_id", "top_doc_combined",
     "evidence_top",
 ]
@@ -49,6 +56,9 @@ _EXPLAIN_FIELDS = [
     "route", "reason",
     "embedding_score", "judge_score", "used_override",
     "combined_score", "is_suspicious",
+    # Hafta 12.2: per-chunk timing. Zero when the stage didn't run
+    # (e.g. judge_time_ms is 0 for SKIP chunks).
+    "embedding_time_ms", "judge_time_ms",
     "text_preview",
 ]
 
@@ -149,12 +159,19 @@ def record_run(
     #      so the counters reflect actual chunk-level work, not doc-level.
     #   3. Doc-level fallback: one virtual chunk per suspicious doc.
     counts = {"skip": 0, "fast_judge": 0, "deep_judge": 0, "overrides": 0}
+    # Hafta 12.2: parallel timing accumulators. Populated when per_doc_routes
+    # has RouteDecision objects with the new *_time_ms fields. The
+    # chunk_breakdown path can't populate these (legacy chunk dicts have
+    # no timing fields) → those rows contribute 0 here, which is honest.
+    timing = {"embedding_phase_ms": 0, "judge_phase_ms": 0}
     if per_doc_routes:
         for decisions in per_doc_routes.values():
             for d in decisions:
                 counts[d.route.value] += 1
                 if d.used_override:
                     counts["overrides"] += 1
+                timing["embedding_phase_ms"] += int(getattr(d, "embedding_time_ms", 0) or 0)
+                timing["judge_phase_ms"] += int(getattr(d, "judge_time_ms", 0) or 0)
     else:
         for doc in result.doc_scores:
             chunk_breakdown = getattr(doc, "chunk_scores", None) or []
@@ -169,11 +186,27 @@ def record_run(
                         counts["fast_judge"] += 1
                     else:
                         counts["skip"] += 1
+                    # Per-chunk timing was added in Hafta 12.2; legacy
+                    # chunk dicts won't have these keys → contribute 0.
+                    timing["embedding_phase_ms"] += int(c.get("embedding_time_ms", 0) or 0)
+                    timing["judge_phase_ms"] += int(c.get("judge_time_ms", 0) or 0)
             elif doc.is_suspicious:
                 # Doc-level fallback (no chunked analysis) — count as one
                 # deep_judge so route_overrides flag the override path.
                 counts["deep_judge"] += 1
                 counts["overrides"] += 1
+
+    # Aggregate cost metrics: how much routing avoided unnecessary
+    # judge calls. `total_chunks_evaluated` is the denominator; missing
+    # chunk-level data → falls back to total_docs so the column is
+    # never empty in legacy runs.
+    total_chunks = counts["skip"] + counts["fast_judge"] + counts["deep_judge"]
+    if total_chunks == 0:
+        total_chunks = int(result.total_docs or 0)
+    total_judge_calls = counts["fast_judge"] + counts["deep_judge"]
+    routing_savings_pct = (
+        (counts["skip"] / total_chunks * 100.0) if total_chunks > 0 else 0.0
+    )
 
     # Top doc = highest combined score
     top_doc: Optional[CombinedDocScore] = None
@@ -197,6 +230,11 @@ def record_run(
         "route_fast_judge": counts["fast_judge"],
         "route_deep_judge": counts["deep_judge"],
         "route_overrides": counts["overrides"],
+        "total_chunks_evaluated": int(total_chunks),
+        "total_llm_judge_calls": int(total_judge_calls),
+        "routing_savings_pct": round(routing_savings_pct, 2),
+        "embedding_phase_ms": int(timing["embedding_phase_ms"]),
+        "judge_phase_ms": int(timing["judge_phase_ms"]),
         "top_doc_id": top_doc.doc_id if top_doc else "",
         "top_doc_combined": round(top_doc.combined_score, 4) if top_doc else 0.0,
         "evidence_top": " | ".join(evidence)[:200],
@@ -231,6 +269,8 @@ def record_run(
                 "used_override": int(bool(d.used_override)),
                 "combined_score": round(doc.combined_score, 4),
                 "is_suspicious": int(bool(doc.is_suspicious)),
+                "embedding_time_ms": int(getattr(d, "embedding_time_ms", 0) or 0),
+                "judge_time_ms": int(getattr(d, "judge_time_ms", 0) or 0),
                 "text_preview": (d.text_preview or "")[:200],
             })
 

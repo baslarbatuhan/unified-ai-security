@@ -78,31 +78,73 @@ class APIAdapter(ChatbotAdapter):
     # helpers
     # ------------------------------------------------------------------
     def _auth_headers(self) -> Dict[str, str]:
-        auth = self.target.auth or {}
-        atype = auth.get("type")
+        """Build the per-request header set from `target.auth`.
+
+        Hafta 11.2: dispatch on the discriminated union's `.type` literal.
+        `extra_headers` from any auth variant (including `none`) is merged
+        last so vendor-specific static headers (OpenAI org id, tenant id,
+        Accept-Version pinning) always make it onto the request.
+
+        Returns an empty dict for `none` auth + empty extras — that's fine
+        for open endpoints; the caller adds Content-Type as needed.
+        """
+        auth = self.target.auth
+        atype = getattr(auth, "type", None)
         headers: Dict[str, str] = {}
 
         if atype == "bearer":
-            token = auth.get("token")
-            if not token and auth.get("token_env"):
-                token = os.environ.get(auth["token_env"], "")
+            # Prefer env-var lookup; fall back to inline `token` for tests
+            # and the legacy YAML shape.
+            token = (auth.token or "")
+            if not token and auth.token_env:
+                token = os.environ.get(auth.token_env, "")
             if token:
                 headers["Authorization"] = f"Bearer {token}"
+
         elif atype == "header":
-            extra = auth.get("headers") or {}
-            if isinstance(extra, dict):
-                for k, v in extra.items():
-                    headers[str(k)] = str(v)
+            for k, v in (auth.headers or {}).items():
+                headers[str(k)] = str(v)
+
         elif atype == "basic":
-            # httpx accepts auth tuple, but we emit header so the adapter is
-            # uniform and the test path doesn't need httpx.BasicAuth.
-            user = auth.get("username", "")
-            pw = auth.get("password", "")
-            import base64
-            token = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
-            headers["Authorization"] = f"Basic {token}"
-        # unknown / empty → no headers; that's fine for open endpoints.
-        return headers
+            user = auth.username or (os.environ.get(auth.username_env, "") if auth.username_env else "")
+            pw = auth.password or (os.environ.get(auth.password_env, "") if auth.password_env else "")
+            if user or pw:
+                import base64
+                token = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
+                headers["Authorization"] = f"Basic {token}"
+
+        # `query` auth doesn't add headers — it's applied to the URL via
+        # `_apply_query_auth` at request time.
+
+        # Always merge extra_headers (works for any auth type, including
+        # `none`). Caller-set headers take precedence over extras, so we
+        # write extras first.
+        merged = dict(getattr(auth, "extra_headers", {}) or {})
+        merged.update(headers)
+        return {str(k): str(v) for k, v in merged.items()}
+
+    def _apply_query_auth(self, params: Dict[str, str]) -> Dict[str, str]:
+        """For `auth.type=query`, merge the auth key/value into the query
+        params dict. No-op for other auth types. The query param is added
+        even if the caller's `_render_query()` didn't produce one — handy
+        for endpoints that take only the auth key (no prompt body).
+        """
+        auth = self.target.auth
+        if getattr(auth, "type", None) != "query":
+            return params
+        value = auth.query_value or ""
+        if not value and auth.query_value_env:
+            value = os.environ.get(auth.query_value_env, "")
+        if not value:
+            # Missing secret at runtime — surface as empty param so the
+            # downstream 401/403 is the visible failure mode instead of a
+            # silent skip. Logs will show the missing env var.
+            value = ""
+        # Caller-provided params win on collision (extremely unlikely; we
+        # don't want auth to overwrite a `key` param the template emitted).
+        out = {auth.query_key: value}
+        out.update(params)
+        return out
 
     def _render_template(self, prompt: str, session_context: Dict[str, Any]) -> Dict[str, Any]:
         tpl = copy.deepcopy(self.target.request_template or DEFAULT_REQUEST_TEMPLATE)
@@ -196,6 +238,10 @@ class APIAdapter(ChatbotAdapter):
         try:
             if method == "GET":
                 params = self._render_query(prompt, session_context)
+                # Hafta 11.2: append the auth.query key/value when
+                # auth.type=query. No-op for other auth types so existing
+                # GET targets are unaffected.
+                params = self._apply_query_auth(params)
                 # Pre-flight URL length sanity check — query strings get
                 # truncated by gateways/CDNs around 2-4 KB. Surface this
                 # as a config error (not a transport error) so the runner
@@ -211,7 +257,12 @@ class APIAdapter(ChatbotAdapter):
             else:  # POST default — backward compatible
                 headers["Content-Type"] = "application/json"
                 body = self._render_template(prompt, session_context)
-                resp = client.post(url, headers=headers, json=body)
+                # Hafta 11.2: even POST endpoints may use query auth
+                # (e.g. Gemini's generateContent uses ?key=… alongside a
+                # JSON body). For auth types other than `query` this is
+                # an empty dict and httpx omits the query string.
+                params = self._apply_query_auth({})
+                resp = client.post(url, headers=headers, json=body, params=params or None)
         except httpx.TimeoutException as exc:
             raise AdapterTimeout(
                 f"{method} {url} timed out after {self.target.timeout_seconds}s"

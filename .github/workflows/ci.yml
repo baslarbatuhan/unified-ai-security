@@ -1,0 +1,150 @@
+name: CI
+
+# Triggered on push to feature/main + on PRs. Goal: catch regressions
+# (test failures, syntax errors, schema breaks) before they land. The
+# Docker build job is opt-in via the `docker` workflow_dispatch input
+# because the gateway image is multi-GB (torch + sentence-transformers)
+# and pulls slow on hosted runners.
+
+on:
+  push:
+    branches: [main, feature/**]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      docker:
+        description: "Also build the Docker images (slow)"
+        type: boolean
+        default: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Unit tests — fast, runs on every push/PR
+  # ---------------------------------------------------------------------
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep the matrix tight — the engine pins Python 3.10+ but we
+        # exercise 3.11 + 3.12 to catch typing changes early.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install CPU-only torch
+        # torch is the largest dependency; pin to CPU wheels so the
+        # GitHub runner doesn't try to fetch the CUDA build.
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sanity import (catches missing __init__ + circular import)
+        run: |
+          python -c "import api.api_main; import fusion_gateway.engine; import tools; print('imports OK')"
+
+      - name: Run pytest
+        # Same ignores the local dev shell uses — the *_advanced_rag_*
+        # tests need a populated Chroma instance that CI doesn't have.
+        run: |
+          pytest tests/ -q \
+            --ignore=tests/test_advanced_rag_hybrid.py \
+            --ignore=tests/test_advanced_rag_poisoning.py \
+            --ignore=tests/test_rag_poison_detection.py
+
+  # ---------------------------------------------------------------------
+  # Lightweight syntax + config check — separate job so a yaml typo
+  # fails fast even when pytest is slow.
+  # ---------------------------------------------------------------------
+  syntax:
+    name: syntax + config sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install PyYAML + Pydantic only
+        # Don't pull the full requirements set — this job catches yaml
+        # parse errors and Python syntax issues. ML deps not needed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml pydantic
+
+      - name: Compile every Python file
+        run: python -m compileall -q api configs dashboard external_eval fusion_gateway prompt_guard rag_guard output_guard output_agency_defense schemas scripts tools utils
+
+      - name: Validate timeout_config.yaml schema
+        run: |
+          python - <<'PY'
+          import yaml, sys
+          d = yaml.safe_load(open("configs/timeout_config.yaml"))
+          assert "profiles" in d, "timeout_config.yaml missing 'profiles'"
+          for name, prof in d["profiles"].items():
+              assert "modules" in prof, f"profile {name!r} missing 'modules'"
+              for mod in ("prompt_guard", "rag_guard", "output_agency"):
+                  assert mod in prof["modules"], f"profile {name!r} missing {mod} budget"
+          print(f"timeout_config.yaml OK ({len(d['profiles'])} profiles)")
+          PY
+
+      - name: Validate targets.yaml against schema
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from schemas.target_schema import TargetsFile
+          import yaml
+          data = yaml.safe_load(open("external_eval/targets.yaml"))
+          tf = TargetsFile(**data)
+          print(f"targets.yaml OK ({len(tf.targets)} targets)")
+          for t in tf.targets:
+              print(f"  {t.id}: type={t.type} auth.type={t.auth.type}")
+          PY
+
+      - name: Validate score weights yaml
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          from dashboard.lib.recommendations import _load_score_config
+          cfg = _load_score_config()
+          assert cfg["max_score"] > 0
+          for k in ("miss", "latency", "quality"):
+              assert k in cfg["weights"], f"missing weight: {k}"
+              assert cfg["weights"][k] >= 0, f"negative weight: {k}"
+          print(f"security_score_weights.yaml OK ({cfg})")
+          PY
+
+  # ---------------------------------------------------------------------
+  # Docker build — opt-in. Verifies the image still builds end-to-end
+  # against the latest Dockerfile + requirements.txt. We don't run the
+  # container in CI because Ollama / Chroma aren't available.
+  # ---------------------------------------------------------------------
+  docker-build:
+    name: docker compose build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.event.inputs.docker == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build gateway + dashboard images
+        # The default build context is the repo root.
+        working-directory: infra
+        run: docker compose -f docker-compose.yml build gateway dashboard

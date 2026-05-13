@@ -92,7 +92,14 @@ class SecurityGateway:
             AnalyzeResponse with decision, per-module scores, evidence, and latency.
         """
         t0 = time.time()
-        run_id = new_run_id("api")
+        # Honour the caller's run_id when supplied (external_eval suite runs,
+        # explicit dashboard launches). Fresh `api_*` only for ad-hoc HTTP
+        # calls so historical "anonymous" requests stay grouped.
+        run_id = getattr(request, "run_id", None) or new_run_id("api")
+        # Carried onto every emitted event so the dashboard can filter by
+        # target/attack alongside run_id without joining tables.
+        ev_target_id = getattr(request, "target_id", None) or None
+        ev_attack_id = getattr(request, "case_id", None) or None
 
         # --- Extract fields for FusionEngine ---
         prompt = request.get_prompt()
@@ -103,6 +110,8 @@ class SecurityGateway:
         try:
             emit_telemetry(RequestEvent(
                 run_id=run_id,
+                target_id=ev_target_id,
+                attack_id=ev_attack_id,
                 prompt=prompt,
                 prompt_char_count=len(prompt or ""),
                 has_retrieved_docs=bool(request.retrieved_docs),
@@ -150,6 +159,9 @@ class SecurityGateway:
             user_id=user_id,
             tool_candidates=tool_candidates_dicts,
             overrides=overrides_dict,
+            run_id=getattr(request, "run_id", None) or "live",
+            case_id=getattr(request, "case_id", None) or "",
+            target_id=getattr(request, "target_id", None) or "",
         )
 
         # --- Map to new AnalyzeResponse ---
@@ -192,6 +204,8 @@ class SecurityGateway:
             for mr in module_risks_parsed:
                 emit_telemetry(ModuleResultEvent(
                     run_id=run_id,
+                    target_id=ev_target_id,
+                    attack_id=ev_attack_id,
                     module=mr.module,
                     risk_score=max(0.0, min(1.0, float(mr.risk_score))),
                     confidence=max(0.0, min(1.0, float(mr.confidence or 0.0))),
@@ -201,6 +215,8 @@ class SecurityGateway:
                 ))
             emit_telemetry(FusionDecisionEvent(
                 run_id=run_id,
+                target_id=ev_target_id,
+                attack_id=ev_attack_id,
                 fused_risk_score=max(0.0, min(1.0, float(engine_response.fused_risk))),
                 decision=_norm_decision(engine_response.final_decision),
                 prompt_score=float(prompt_score),
@@ -215,6 +231,7 @@ class SecurityGateway:
 
         return AnalyzeResponse(
             decision=engine_response.final_decision,
+            decision_band=getattr(engine_response, "decision_band", None),
             fused_risk_score=engine_response.fused_risk,
             prompt_score=prompt_score,
             rag_score=rag_score,
@@ -239,7 +256,10 @@ class SecurityGateway:
         session tracking required).
         """
         t0 = time.time()
-        run_id = new_run_id("api-out")
+        # Same run_id propagation as analyze() — caller's id wins over fresh sentinel.
+        run_id = getattr(request, "run_id", None) or new_run_id("api-out")
+        ev_target_id = getattr(request, "target_id", None) or None
+        ev_attack_id = getattr(request, "case_id", None) or None
 
         prompt = request.get_prompt()
         user_id = request.get_user_id()
@@ -248,6 +268,8 @@ class SecurityGateway:
         try:
             emit_telemetry(RequestEvent(
                 run_id=run_id,
+                target_id=ev_target_id,
+                attack_id=ev_attack_id,
                 prompt=prompt,
                 prompt_char_count=len(prompt or ""),
                 has_retrieved_docs=bool(request.retrieved_docs),
@@ -292,6 +314,9 @@ class SecurityGateway:
             user_id=user_id,
             tool_candidates=tool_candidates_dicts,
             overrides=overrides_dict,
+            run_id=getattr(request, "run_id", None) or "live",
+            case_id=getattr(request, "case_id", None) or "",
+            target_id=getattr(request, "target_id", None) or "",
         )
 
         module_risks_parsed = []
@@ -330,6 +355,8 @@ class SecurityGateway:
             for mr in module_risks_parsed:
                 emit_telemetry(ModuleResultEvent(
                     run_id=run_id,
+                    target_id=ev_target_id,
+                    attack_id=ev_attack_id,
                     module=mr.module,
                     risk_score=max(0.0, min(1.0, float(mr.risk_score))),
                     confidence=max(0.0, min(1.0, float(mr.confidence or 0.0))),
@@ -339,6 +366,8 @@ class SecurityGateway:
                 ))
             emit_telemetry(FusionDecisionEvent(
                 run_id=run_id,
+                target_id=ev_target_id,
+                attack_id=ev_attack_id,
                 fused_risk_score=max(0.0, min(1.0, float(engine_response.fused_risk))),
                 decision=_norm_decision(engine_response.final_decision),
                 prompt_score=float(prompt_score),
@@ -353,6 +382,7 @@ class SecurityGateway:
 
         return AnalyzeResponse(
             decision=engine_response.final_decision,
+            decision_band=getattr(engine_response, "decision_band", None),
             fused_risk_score=engine_response.fused_risk,
             prompt_score=prompt_score,
             rag_score=rag_score,

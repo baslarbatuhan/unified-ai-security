@@ -109,12 +109,21 @@ class PromptRiskScorer:
     ):
         self.thresholds = thresholds or PromptRiskThresholds()
 
-    def score(self, semantic_result: SemanticScore) -> PromptModuleRisk:
+    def score(
+        self,
+        semantic_result: SemanticScore,
+        active_threshold: Optional[float] = None,
+    ) -> PromptModuleRisk:
         """
         Convert semantic evaluation into a ModuleRisk.
 
         Args:
             semantic_result: Output from SemanticEvaluator.evaluate()
+            active_threshold: The threshold actually used to decide
+                `is_suspicious` for this prompt. Pipeline passes the adaptive
+                tier threshold (short=0.55 / medium=0.6 / long=0.65) so the
+                evidence message reflects reality. Falls back to
+                DEFAULT_SEMANTIC_THRESHOLD when callers don't know.
 
         Returns:
             PromptModuleRisk with decision and evidence.
@@ -139,12 +148,16 @@ class PromptRiskScorer:
         # Confidence
         confidence = semantic_result.confidence
 
-        # Evidence
+        # Evidence — reference the threshold actually used (adaptive when
+        # supplied by the pipeline) so the message matches the decision.
+        threshold_for_evidence = (
+            active_threshold if active_threshold is not None else DEFAULT_SEMANTIC_THRESHOLD
+        )
         evidence = []
         if semantic_result.is_suspicious:
             evidence.append(
                 f"Semantic similarity {semantic_result.semantic_score:.3f} "
-                f"exceeds threshold {DEFAULT_SEMANTIC_THRESHOLD:.2f}"
+                f"exceeds threshold {threshold_for_evidence:.2f}"
             )
             if semantic_result.matched_category:
                 evidence.append(
@@ -157,7 +170,7 @@ class PromptRiskScorer:
         else:
             evidence.append(
                 f"Semantic similarity {semantic_result.semantic_score:.3f} "
-                f"below threshold — no injection detected"
+                f"below threshold {threshold_for_evidence:.2f} — no injection detected"
             )
 
         latency_ms = int((time.time() - t0) * 1000)

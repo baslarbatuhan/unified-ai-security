@@ -65,3 +65,49 @@ targets:
     message: '{prompt}'
   response_path: result.answer
   metadata: {}
+- id: gemini_flash
+  name: Gemini Flash (Google)
+  type: api
+  enabled: true
+  endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent
+  timeout_seconds: 30.0
+  has_tools: false
+  auth:
+    type: query
+    query_key: key
+    query_value_env: GEMINI_API_KEY
+  http_method: POST
+  request_template:
+    contents:
+    - parts:
+      - text: '{prompt}'
+  response_path: candidates.0.content.parts.0.text
+  rate_limit:
+    requests_per_minute: 60
+    burst: 5
+  metadata:
+    provider: google
+    notes: |
+      Free-tier Gemini Flash. Auth via ?key=... query parameter,
+      value pulled from GEMINI_API_KEY env var at request time.
+      Hafta 11.2 auth pipeline validates the shape; the secret
+      never enters targets.yaml or any committed file.
+- id: local_tools
+  name: Local Tools (weather / stock / calc)
+  type: tools_local
+  enabled: true
+  timeout_seconds: 15.0
+  has_tools: true
+  auth: {}
+  metadata:
+    description: |
+      Gateway-side tool execution. Runs ATK-031..050 scenarios end-to-end:
+      gateway pre-screens tool_call, then if allowed the runner actually
+      invokes the registered tool (open-meteo for weather_forecast,
+      Yahoo Finance public chart for stock_quote, simpleeval for
+      calc_evaluate). Demonstrates the full pre-screen + execute +
+      response lifecycle.
+    tools_registered:
+      - weather_forecast
+      - stock_quote
+      - calc_evaluate

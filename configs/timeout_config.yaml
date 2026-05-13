@@ -1,19 +1,43 @@
 # configs/timeout_config.yaml
 # =============================
-# Per-module timeout budgets. Consumed by the circuit breaker (Phase 1B-α)
-# and the external eval runner (Phase 1A). Exceeding a budget triggers the
-# fallback path for that module; the request path always returns.
+# Per-module timeout budgets. Consumed by the circuit breaker (Phase 1B-α),
+# the external eval runner (Phase 1A), and the fusion engine's _run_parallel
+# (Hafta 11). Exceeding a budget triggers the configured on_timeout policy
+# for that module; the request path always returns.
 #
 # "standard" is the default profile used by the gateway.
 # "fast" is for dashboard demos / interactive testing.
 # "generous" is for batch eval on slow hardware (CPU-only Ollama).
+#
+# Hafta 11 additions:
+#   - `llm_judge_ms`: hard limit per Ollama call. Must be < rag_guard_ms.
+#   - `on_timeout`: per-module fail-CLOSED policy. Possible values:
+#       allow     → risk_score=0.0 (legacy fail-open; not recommended)
+#       sanitize  → risk_score=0.5 (downgrade traffic but don't block)
+#       block     → risk_score=1.0 (hard fail-closed; safest)
+#     Engine maps these to ModuleRisk so the fusion layer naturally
+#     escalates the fused score via max-rule override.
 
 profiles:
 
   standard:
     # Per-module budgets (milliseconds).
+    #
+    # Hafta 14: prompt_guard 500→10000ms because cold-start dominated
+    # the budget (BGE-M3 load + signature encoding on request path).
+    #
+    # Hafta 15: warm-up cache fix (UAIS_WARM_UP_PIPELINES env var) +
+    # FusionEngine init hook → real per-request latency dropped:
+    #   mean = 71 ms, p50 = 50 ms, p95 = 201 ms, max = 201 ms
+    #     (20-sample measurement, mixed benign + adversarial prompts,
+    #      Docker CPU-only).
+    #
+    # Tightened to 2000 ms = ~10× p95. Headroom enough for legit
+    # production variance (longer prompts, concurrent load, retry
+    # paths) while letting fail-CLOSED policy fire on genuine
+    # pathologies (model hang, missing weights, etc.).
     modules:
-      prompt_guard:   500
+      prompt_guard:  2000
       rag_guard:    20000   # chunked analysis with qwen2.5:7b CPU-bound
       output_agency: 2000
       output_guard:  3000
@@ -21,6 +45,15 @@ profiles:
     # Hard ceiling from request arrival to response. Must be >= sum of
     # parallel module budgets + fusion, with a small safety margin.
     total_request_ms: 25000
+    # LLM judge ceiling — kept under rag_guard so a single hang doesn't
+    # blow the rag budget. Acts as a sub-budget inside the RAG pipeline.
+    llm_judge_ms: 18000
+    # Per-module fail-CLOSED policy on timeout/exception.
+    on_timeout:
+      prompt_guard:  sanitize   # prompt is text-only; sanitize is safe
+      rag_guard:     block      # RAG context can carry payloads; be strict
+      output_agency: block      # tool calls without authz = critical
+      output_guard:  sanitize   # output text; sanitize over block
     # Adapter-level timeouts for external_eval.
     adapter:
       api_ms:        10000
@@ -34,6 +67,12 @@ profiles:
       output_guard:  1500
       fusion:         150
     total_request_ms: 12000
+    llm_judge_ms:    6000
+    on_timeout:
+      prompt_guard:  sanitize
+      rag_guard:     block
+      output_agency: block
+      output_guard:  sanitize
     adapter:
       api_ms:         5000
       web_ms:        15000
@@ -46,6 +85,12 @@ profiles:
       output_guard:  8000
       fusion:         300
     total_request_ms: 75000
+    llm_judge_ms:   50000
+    on_timeout:
+      prompt_guard:  sanitize
+      rag_guard:     block
+      output_agency: block
+      output_guard:  sanitize
     adapter:
       api_ms:        30000
       web_ms:        90000

@@ -85,6 +85,13 @@ class AnalyzeRequest(BaseModel):
     retrieved_context: Optional[str] = Field(default=None, exclude=True)
     role: str = Field(default="basic", exclude=True)
 
+    # Run/case identifiers — propagated to live writers so per-run filtering
+    # works on rag_final_metrics.csv / output_security_metrics.csv. Defaults
+    # match the engine's "live" sentinel for ad-hoc requests.
+    run_id: Optional[str] = Field(default=None, description="Run id for live writer attribution.")
+    case_id: Optional[str] = Field(default=None, description="Case id within the run.")
+    target_id: Optional[str] = Field(default=None, description="External target id, if any.")
+
     def get_prompt(self) -> str:
         """Return prompt, falling back to legacy user_input."""
         return self.prompt or self.user_input or ""
@@ -100,7 +107,15 @@ class AnalyzeRequest(BaseModel):
 # Gateway response — expanded
 # ---------------------------------------------------------------------------
 class AnalyzeResponse(BaseModel):
-    decision: Decision = Field(..., description="Final gateway decision")
+    decision: Decision = Field(..., description="Final gateway decision (3-class: allow/sanitize/block)")
+    decision_band: Optional[Decision] = Field(
+        default=None,
+        description=(
+            "Granular score band (4-class: allow/sanitize/flag/block). "
+            "`flag` is suspicion-tier — collapsed to `block` in `decision`. "
+            "Auditors use this to separate confident blocks from flag-tier."
+        ),
+    )
     fused_risk_score: float = Field(..., ge=0.0, le=1.0)
     prompt_score: float = Field(default=0.0, ge=0.0, le=1.0)
     rag_score: float = Field(default=0.0, ge=0.0, le=1.0)

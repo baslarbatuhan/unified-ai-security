@@ -182,9 +182,14 @@ class PromptGuardPipeline:
         # If pattern detector found a match, lower the bar for semantic
         # confirmation (combined signal is stronger)
         semantic_suspicious = semantic_result.is_suspicious
+        # Track the threshold actually used so the evidence message can
+        # cite it (adaptive tier, possibly boosted by pattern co-signal).
+        effective_threshold = adaptive_threshold
         if not semantic_suspicious and pattern_result.is_detected:
             boosted_threshold = adaptive_threshold - 0.05
             semantic_suspicious = semantic_result.semantic_score >= boosted_threshold
+            if semantic_suspicious:
+                effective_threshold = boosted_threshold
 
         is_injection = (
             semantic_suspicious or pattern_result.is_detected
@@ -212,7 +217,7 @@ class PromptGuardPipeline:
             top_k_similarities=semantic_result.top_k_similarities,
             confidence=semantic_result.confidence,
         )
-        risk = self.risk_scorer.score(combined_semantic)
+        risk = self.risk_scorer.score(combined_semantic, active_threshold=effective_threshold)
 
         # Add deobfuscation/normalization evidence to risk
         if deob_report["changed"]:

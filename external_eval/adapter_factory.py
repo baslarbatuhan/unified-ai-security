@@ -31,6 +31,12 @@ def build_adapter(target: TargetConfig) -> ChatbotAdapter:
     if target.type == "mock":
         from external_eval.mock_adapter import MockAdapter
         return MockAdapter(target)
+    if target.type == "tools_local":
+        # Hafta 14: tool execution runs gateway-side. The adapter is a
+        # no-op placeholder so the runner's target-selection path stays
+        # uniform; actual invocation happens via `tools.invoke()`.
+        from external_eval.tool_adapter import ToolAdapter
+        return ToolAdapter(target)
 
     raise AdapterConfigError(f"unknown target type {target.type!r}")
 

@@ -57,20 +57,39 @@ _targets_by_id = {t["id"]: t for t in targets}
 MODELS = ["qwen2.5:7b", "qwen2.5:3b", "llama3.1:8b", "mistral:7b"]
 
 
-with st.form("run_test_form"):
-    cT, cS = st.columns(2)
-    target_id = cT.selectbox("Target", target_ids)
-    suite = cS.selectbox(
-        "Attack suite",
-        ["prompt_injection", "rag_poisoning", "agency_social", "all", "single"],
-    )
+# Target + suite live OUTSIDE the form so the form below can react to the
+# suite selection — Streamlit forms don't expose widget state until submit,
+# which made conditional disabling (e.g. output_guard for suite mode)
+# impossible to do correctly inside a single form.
+cT, cS = st.columns(2)
+target_id = cT.selectbox("Target", target_ids)
+suite = cS.selectbox(
+    "Attack suite",
+    ["prompt_injection", "rag_poisoning", "agency_social", "all", "single"],
+)
+_is_suite_mode = suite != "single"
 
+with st.form("run_test_form"):
     st.markdown("**Active modules**")
     mc1, mc2, mc3, mc4 = st.columns(4)
     use_prompt = mc1.checkbox("prompt_guard", value=True)
     use_rag = mc2.checkbox("rag_guard", value=True)
     use_agency = mc3.checkbox("output_agency", value=True)
-    use_output = mc4.checkbox("output_guard", value=False)
+    # output_guard is post-LLM only — disabled in suite mode (which always
+    # routes through the pre-LLM /analyze path). Disabling makes the
+    # constraint visible at the point of decision instead of after submit.
+    use_output = mc4.checkbox(
+        "output_guard",
+        value=False,
+        disabled=_is_suite_mode,
+        help=(
+            "Post-LLM module. Suite mode always uses the pre-LLM /analyze "
+            "path, so output_guard is ignored there. Switch to suite=single "
+            "and paste a model output to evaluate it."
+            if _is_suite_mode
+            else "Post-LLM module — only fires when a model output is provided."
+        ),
+    )
 
     cM, cTo = st.columns(2)
     model = cM.selectbox("LLM model (judge / sandbox)", MODELS)
@@ -89,7 +108,17 @@ with st.form("run_test_form"):
     w_prompt = wc1.slider("prompt_guard", 0.0, 1.0, 0.30, 0.05)
     w_rag = wc2.slider("rag_guard", 0.0, 1.0, 0.30, 0.05)
     w_agency = wc3.slider("output_agency", 0.0, 1.0, 0.25, 0.05)
-    w_output = wc4.slider("output_guard", 0.0, 1.0, 0.15, 0.05)
+    # output_guard weight is dead-letter in suite mode (module never runs).
+    # Disable the slider so the user doesn't waste a calibration knob.
+    w_output = wc4.slider(
+        "output_guard", 0.0, 1.0, 0.15, 0.05,
+        disabled=_is_suite_mode,
+        help=(
+            "Suite mode skips output_guard — weight has no effect."
+            if _is_suite_mode
+            else "Weight applied when output_guard contributes (single-shot with model_output)."
+        ),
+    )
 
     st.markdown("**Single-shot prompt** (used when suite = single)")
     user_prompt = st.text_area(
@@ -211,10 +240,29 @@ if suite != "single":
     except GatewayError as exc:
         st.error(f"Could not launch run: {exc}")
         st.stop()
-    st.session_state["last_run_id"] = result.get("run_id", run_id)
-    st.success(
-        f"Suite launched. run_id=`{result.get('run_id')}` — "
-        "open the **Live monitor** page to follow progress."
+    launched_run_id = result.get("run_id", run_id)
+    st.session_state["last_run_id"] = launched_run_id
+    st.success(f"Suite launched. run_id=`{launched_run_id}`")
+    # Deep links — both pages honour ?run_id=... so they land focused on
+    # this run instead of showing the global view.
+    nav_cols = st.columns(3)
+    nav_cols[0].link_button(
+        "📡 Open Live monitor",
+        f"/live_monitor?run_id={launched_run_id}",
+        width="stretch",
+        help="Follow this run's per-module risk + decisions live.",
+    )
+    nav_cols[1].link_button(
+        "📊 Open Results (when done)",
+        f"/results?run_id={launched_run_id}",
+        width="stretch",
+        help="Per-run analytics — populated after the run completes.",
+    )
+    nav_cols[2].link_button(
+        "⚖️ Compare with previous",
+        f"/compare_runs?right={launched_run_id}",
+        width="stretch",
+        help="Side-by-side delta vs the previous run.",
     )
     with st.expander("Launch command", expanded=False):
         st.code(" ".join(result.get("command", [])), language="bash")

@@ -38,17 +38,36 @@ router = APIRouter(prefix="/targets", tags=["targets"])
 
 
 def _redact_auth(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip token / password fields from auth before returning to clients.
+    """Strip secret fields from auth before returning to clients.
 
-    The yaml stores `token_env` (an env-var name) rather than the secret
-    itself, but defence-in-depth: never leak any field whose name suggests
-    a credential.
+    The yaml is supposed to use `*_env` variants (env-var names, safe to
+    show) but defence-in-depth — never leak any field whose name suggests
+    a credential, regardless of auth.type. Hafta 11.2 expands the field
+    list to cover the new `query_value` (Gemini-style) and `password`
+    variants alongside the legacy `token`.
     """
     auth = dict(payload.get("auth") or {})
-    redacted_keys = {"token", "password", "secret", "api_key"}
+
+    # Top-level direct-value fields that must never leave the server.
+    direct_secret_fields = {
+        "token", "password", "secret", "api_key", "query_value",
+    }
     for k in list(auth.keys()):
-        if k.lower() in redacted_keys:
+        if k.lower() in direct_secret_fields and auth[k]:
             auth[k] = "***redacted***"
+
+    # `header` auth stores arbitrary headers; the value of any header
+    # whose name looks credential-y must be redacted too. Conservative
+    # name match — better to over-redact than leak.
+    if isinstance(auth.get("headers"), dict):
+        hdrs = dict(auth["headers"])
+        for hk, hv in list(hdrs.items()):
+            low = str(hk).lower()
+            if any(s in low for s in ("auth", "token", "key", "secret", "password")):
+                if hv:
+                    hdrs[hk] = "***redacted***"
+        auth["headers"] = hdrs
+
     out = dict(payload)
     out["auth"] = auth
     return out

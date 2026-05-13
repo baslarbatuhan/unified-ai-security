@@ -73,9 +73,17 @@ class AnalyzeRequestModel(BaseModel):
     # validated by `ConfigOverrides` before reaching the engine.
     config_overrides: Optional[Dict[str, Any]] = None
 
+    # Run/case identifiers — propagated to live writers (rag_final_metrics.csv,
+    # output_security_metrics.csv) so per-run filtering on those CSVs works.
+    # Optional: legacy clients omit them; defaults match engine.analyze.
+    run_id: Optional[str] = None
+    case_id: Optional[str] = None
+    target_id: Optional[str] = None
+
 
 class AnalyzeResponseModel(BaseModel):
-    final_decision: str
+    final_decision: str  # 3-class: allow / sanitize / block
+    decision_band: Optional[str] = None  # 4-class audit label; "flag" → suspicion-tier block
     fused_risk: float
     prompt_score: float = 0.0
     rag_score: float = 0.0
@@ -175,9 +183,12 @@ app.include_router(dashboard_router)
 from api.routes_runs import router as runs_router  # noqa: E402
 from api.routes_reports import router as reports_router  # noqa: E402
 from api.routes_targets import router as targets_router  # noqa: E402
+# Hafta 12.1: per-decision audit trace lookups (Results page drill-down).
+from api.routes_decisions import router as decisions_router  # noqa: E402
 app.include_router(runs_router)
 app.include_router(reports_router)
 app.include_router(targets_router)
+app.include_router(decisions_router)
 
 # Dashboard UI is a separate Streamlit process (`streamlit run dashboard/app.py`).
 # It consumes this gateway's read-only routes (/dashboard/*, /runs, /reports,
@@ -254,12 +265,16 @@ async def analyze(request: AnalyzeRequestModel):
         tool_candidates=tool_candidates_typed,
         session_context=session,
         config_overrides=overrides_typed,
+        run_id=request.run_id,
+        case_id=request.case_id,
+        target_id=request.target_id,
     )
 
     response = gateway.analyze(schema_request)
 
     return {
         "final_decision": response.decision,
+        "decision_band": getattr(response, "decision_band", None),
         "fused_risk": response.fused_risk_score,
         "prompt_score": response.prompt_score,
         "rag_score": response.rag_score,
@@ -326,12 +341,16 @@ async def analyze_output(request: AnalyzeWithOutputRequestModel):
         tool_candidates=tool_candidates_typed,
         session_context=session,
         config_overrides=overrides_typed,
+        run_id=request.run_id,
+        case_id=request.case_id,
+        target_id=request.target_id,
     )
 
     response = gateway.analyze_with_output(schema_request, model_output=request.model_output)
 
     return {
         "final_decision": response.decision,
+        "decision_band": getattr(response, "decision_band", None),
         "fused_risk": response.fused_risk_score,
         "prompt_score": response.prompt_score,
         "rag_score": response.rag_score,

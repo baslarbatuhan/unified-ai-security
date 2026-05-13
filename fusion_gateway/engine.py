@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -36,8 +37,25 @@ from typing import Any, Dict, List, Literal, Optional
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+# Hafta 11: per-module timeout discipline + fail-CLOSED policy. Loader is
+# tiny (yaml parse only), no runtime cost beyond first call so we import
+# eagerly. Helpers used by _run_parallel / _safe_result below.
+from configs.timeout_loader import (
+    load_timeout_profile,
+    module_budget_ms,
+    on_timeout_policy,
+    policy_risk_score,
+)
+
 
 Decision = Literal["allow", "sanitize", "flag", "block"]
+# Granular score band — 4-class, used inside modules and exposed as
+# `decision_band` on the gateway response for audit trail.
+DecisionBand = Decision
+# Public 3-class final decision — what the gateway tells callers about
+# whether to pass / sanitize / block traffic. `flag` collapses to `block`
+# at this layer (suspicion-tier block, see `_collapse_band`).
+FinalDecision = Literal["allow", "sanitize", "block"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +141,13 @@ class FusionEngineRequest:
 @dataclass
 class FusionEngineResponse:
     """Fusion engine output with fused risk."""
-    final_decision: Decision = "allow"
+    final_decision: FinalDecision = "allow"
     fused_risk: float = 0.0
     module_risks: List[Dict] = field(default_factory=list)
     latency_ms: int = 0
+    # 4-class score band — `flag` here means suspicion-tier block (see
+    # `_collapse_band`). Always present so consumers don't branch on absence.
+    decision_band: DecisionBand = "allow"
 
     def to_dict(self) -> Dict:
         return {
@@ -134,6 +155,7 @@ class FusionEngineResponse:
             "fused_risk": round(self.fused_risk, 4),
             "module_risks": self.module_risks,
             "latency_ms": self.latency_ms,
+            "decision_band": self.decision_band,
         }
 
 
@@ -434,6 +456,55 @@ def _register_gateway_demo_schemas(validator) -> None:
         "component": {"type": "str", "required": False, "max_length": 100},
     })
 
+    # ----------------------------------------------------------------
+    # Hafta 12.3: real-world tool families. Each demonstrates a
+    # different agency-attack surface that the gateway's parameter
+    # validator handles before any LLM-driven tool invocation.
+    #
+    #   weather_forecast  → numeric bounds (IDOR via out-of-range coords)
+    #   stock_quote       → regex shape (enumeration via sequential
+    #                       symbols caught by anti-enum guard at runtime,
+    #                       malformed symbols caught here)
+    #   calc_evaluate     → text deny-list (code injection through eval)
+    # ----------------------------------------------------------------
+    # Open-meteo style coordinates: lat ∈ [-90, 90], lon ∈ [-180, 180].
+    # Out-of-range numeric values are the classical IDOR-via-coercion;
+    # path-traversal strings get rejected on type check (str → float).
+    validator.register_tool_schema("weather_forecast", {
+        "latitude": {
+            "type": "float", "required": True,
+            "min_value": -90.0, "max_value": 90.0,
+        },
+        "longitude": {
+            "type": "float", "required": True,
+            "min_value": -180.0, "max_value": 180.0,
+        },
+        "current_weather": {"type": "bool", "required": False},
+    })
+    # yfinance-style ticker. Symbol regex matches NYSE / NASDAQ (1-5
+    # uppercase) plus dotted variants like BRK.A / TSE.TO. Enumeration
+    # detection lives in the anti-enum guard (sequential calls), not
+    # the parameter validator — the validator just refuses malformed
+    # values (path traversal, SQL injection, oversized strings).
+    validator.register_tool_schema("stock_quote", {
+        "symbol": {
+            "type": "str", "required": True, "max_length": 10,
+            "pattern": r"^[A-Z]{1,5}(\.[A-Z]{1,3})?$",
+        },
+    })
+    # Calculator: allow-list math expression. We rely on the suspicious
+    # content patterns inside ParameterValidator (already covers
+    # `import`, `__`, `eval`, `os.`, etc.) PLUS a regex that requires
+    # the expression to contain *only* digits, operators, dots,
+    # parentheses, and whitespace. Anything else (letters, $, `, ;)
+    # is a code-injection attempt.
+    validator.register_tool_schema("calc_evaluate", {
+        "expression": {
+            "type": "str", "required": True, "max_length": 200,
+            "pattern": r"^[0-9+\-*/().\s]+$",
+        },
+    })
+
 
 def _evaluate_agency_guard(
     tool_call: Optional[Dict],
@@ -497,10 +568,16 @@ def _evaluate_agency_guard(
             risk_score = max(risk_score, 0.95)
             evidence.append(f"Unregistered tool rejected: '{tool_name}'")
 
-        # Role-based access control
+        # Role-based access control.
+        # Hafta 14: weather_forecast / stock_quote / calc_evaluate are
+        # public tools — no ownership semantics, anyone can call them.
+        # Allow-listed on every non-admin role so the authz layer doesn't
+        # double-block what ParameterValidator has already cleared.
+        PUBLIC_TOOLS = {"weather_forecast", "stock_quote", "calc_evaluate"}
         ROLE_PERMISSIONS = {
-            "basic": {"get_order", "cancel_order", "get_ticket", "update_ticket", "system_status"},
-            "viewer": {"get_order", "get_ticket", "system_status"},
+            "basic": {"get_order", "cancel_order", "get_ticket", "update_ticket",
+                      "system_status"} | PUBLIC_TOOLS,
+            "viewer": {"get_order", "get_ticket", "system_status"} | PUBLIC_TOOLS,
             "admin": REGISTERED_TOOLS,
         }
         allowed_tools = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["basic"])
@@ -631,7 +708,143 @@ def _threshold_decision_with(score: float, thresholds: Dict[str, float]) -> Deci
     elif score >= block_t:
         return "block"
     else:
+        # [sanitize_t, block_t) — high suspicion, not strong enough for a
+        # confident block. Treated as block at the gateway final-decision
+        # layer (see `_collapse_band`) but kept distinct here so audit can
+        # tell suspicion-tier rejections from confident ones.
         return "flag"
+
+
+def _collapse_band(band: DecisionBand) -> FinalDecision:
+    """Collapse the 4-class score band to the gateway's 3-class final
+    decision. `flag` and `block` both stop traffic at the gateway — the
+    band stays on the response for audit trail.
+    """
+    return "block" if band == "flag" else band  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Hafta 12.1: decision trace writer
+# ---------------------------------------------------------------------------
+# `analyze()` calls this once per request after fusion settles. We write a
+# single row per case to `runs/<run_id>/decision_trace.csv` so the
+# dashboard's Results page can drill into "why was this blocked".
+# Best-effort: any failure is swallowed — telemetry mustn't break the
+# request path.
+
+def _format_fusion_formula(
+    weights: Dict[str, float],
+    risks: Dict[str, float],
+    weighted_sum: float,
+    final_fused: float,
+    override_applied: str,
+) -> str:
+    """Human-readable fusion formula snapshot for audit.
+
+    Example: "0.30*0.55 + 0.30*0.71 + 0.40*0.00 = 0.378 → max-rule
+    override(elevated) → 0.71"
+    """
+    parts = []
+    for k in ("prompt_guard", "rag_guard", "output_agency"):
+        w = float(weights.get(k, 0.0))
+        s = float(risks.get(k, 0.0))
+        if w > 0:
+            parts.append(f"{w:.2f}*{s:.3f}")
+    expr = " + ".join(parts) if parts else "0"
+    formula = f"{expr} = {weighted_sum:.4f}"
+    if override_applied != "none":
+        formula += f"  →  max-rule override({override_applied}) → {final_fused:.4f}"
+    else:
+        formula += f"  →  no override → {final_fused:.4f}"
+    return formula
+
+
+def _try_append_decision_trace(
+    *,
+    run_id: Optional[str],
+    case_id: Optional[str],
+    target_id: Optional[str],
+    final_decision: FinalDecision,
+    band: DecisionBand,
+    fused_risk: float,
+    weighted_sum: float,
+    override_applied: str,
+    eff_weights: Dict[str, float],
+    eff_thresholds: Dict[str, float],
+    prompt_risk: ModuleRisk,
+    rag_risk: ModuleRisk,
+    agency_risk: ModuleRisk,
+    output_risk: Optional[ModuleRisk] = None,
+    latency_ms: int = 0,
+) -> None:
+    """Write one decision_trace row. No-op when run_id is the 'live'
+    sentinel (ad-hoc /analyze with no scoped run) — the trace file is a
+    per-run artefact, not a global write-amplification target.
+    """
+    rid = (run_id or "").strip()
+    if not rid or rid == "live":
+        return
+    try:
+        from pathlib import Path
+        from utils.run_manifest import append_decision_trace as _append
+
+        _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+        run_dir = _PROJECT_ROOT / "runs" / rid
+
+        risks = {
+            "prompt_guard": float(prompt_risk.risk_score),
+            "rag_guard": float(rag_risk.risk_score),
+            "output_agency": float(agency_risk.risk_score),
+        }
+        # Triggering module = whichever produced the max risk_score. Tie-breaks
+        # follow dict iteration order, which is stable in Python 3.7+ and
+        # matches the order modules contribute to fusion above.
+        triggering_module = max(risks, key=lambda k: risks[k])
+        triggering_band = _threshold_decision_with(
+            risks[triggering_module], eff_thresholds
+        )
+
+        # Compact per-module summary — top-1 evidence string only, so the
+        # CSV cell stays under common spreadsheet limits.
+        def _summary(m: ModuleRisk) -> Dict[str, Any]:
+            ev = list(m.evidence or [])
+            return {
+                "module": m.module,
+                "risk_score": round(float(m.risk_score), 4),
+                "decision": m.decision,
+                "top_evidence": (ev[0] if ev else "")[:200],
+            }
+
+        module_rows = [_summary(prompt_risk), _summary(rag_risk), _summary(agency_risk)]
+        if output_risk is not None:
+            module_rows.append(_summary(output_risk))
+
+        row = {
+            "case_id": case_id or "",
+            "target_id": target_id or "",
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "final_decision": final_decision,
+            "decision_band": band,
+            "fused_risk": round(float(fused_risk), 4),
+            "weighted_sum": round(float(weighted_sum), 4),
+            "override_applied": override_applied,
+            "triggering_module": triggering_module,
+            "triggering_band": triggering_band,
+            "prompt_score": round(float(prompt_risk.risk_score), 4),
+            "rag_score": round(float(rag_risk.risk_score), 4),
+            "agency_score": round(float(agency_risk.risk_score), 4),
+            "output_score": round(
+                float(output_risk.risk_score) if output_risk else 0.0, 4
+            ),
+            "fusion_formula": _format_fusion_formula(
+                eff_weights, risks, weighted_sum, fused_risk, override_applied
+            ),
+            "module_risks_json": module_rows,
+            "latency_ms": int(latency_ms or 0),
+        }
+        _append(run_dir, row=row)
+    except Exception:  # noqa: BLE001 — telemetry never breaks request path
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +868,87 @@ class FusionEngine:
         override: Optional[Dict[str, float]] = None,
         parallel: bool = True,
         max_workers: int = 3,
+        timeout_profile: str = "standard",
     ):
         self.weights = weights or DEFAULT_WEIGHTS
         self.thresholds = thresholds or DEFAULT_THRESHOLDS
         self.override = override or DEFAULT_OVERRIDE
         self.parallel = parallel
         self.max_workers = max_workers
+        # Hafta 11: load the per-module timeout profile once at construction.
+        # Falls back to an empty dict if the yaml is missing so the engine
+        # still works in minimal installs (CI without the configs dir).
+        try:
+            self._timeout_profile = load_timeout_profile(timeout_profile)
+        except (FileNotFoundError, KeyError):
+            self._timeout_profile = {}
+        self._timeout_profile_name = timeout_profile
+
+        # Hafta 15: optional pre-load. The BGE-M3 model + attack-signature
+        # encoding takes ~11s on CPU; without warm-up the first request
+        # eats that latency, trips the prompt_guard timeout policy, and
+        # fail-CLOSED synthesises a 0.5 risk that fusion can dilute below
+        # the block threshold (Gemini suite miss demonstrated this). Env
+        # gate so test suites stay fast — production / dashboard runs
+        # set UAIS_WARM_UP_PIPELINES=1 in docker-compose.yml.
+        warm = os.environ.get("UAIS_WARM_UP_PIPELINES", "").strip().lower()
+        if warm in ("1", "true", "yes", "on"):
+            self._warm_up_pipelines()
+
+    def _warm_up_pipelines(self) -> None:
+        """Best-effort eager init of the prompt-guard pipeline + a dummy
+        inference so the first real request doesn't pay the model's
+        first-call cost on top of the global cache miss.
+
+        Two-phase warm-up (both required):
+          1. `_get_prompt_pipeline()` — loads BGE-M3 + signature corpus
+             into the module-global cache so subsequent calls are O(1).
+          2. `pipeline.run("warmup")` — exercises the actual inference
+             path so torch / transformers initialise their internal
+             kernels. Skipping this leaves a hidden ~10s cost on the
+             first analyze() call (the Gemini suite miss demonstrated
+             exactly this — pipeline was loaded but first inference
+             still tripped the timeout policy).
+
+        Failures are logged to stderr but never block construction.
+        RAG pipeline is intentionally left lazy: it depends on Chroma +
+        Ollama being reachable, which may not be ready at startup.
+
+        We log start + end of both phases so the runner.log makes it
+        obvious whether warm-up ran in this process (subprocesses pay
+        their own cost — uvicorn's warm-up doesn't help them).
+        """
+        import sys
+        t_load = time.time()
+        print("[FusionEngine] warm-up: loading prompt_guard pipeline...",
+              file=sys.stderr, flush=True)
+        try:
+            pipeline = _get_prompt_pipeline()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[FusionEngine] prompt_guard load failed: {exc}", file=sys.stderr)
+            return
+        load_ms = int((time.time() - t_load) * 1000)
+        print(f"[FusionEngine] warm-up: pipeline loaded in {load_ms}ms",
+              file=sys.stderr, flush=True)
+
+        t_inf = time.time()
+        print("[FusionEngine] warm-up: priming first inference...",
+              file=sys.stderr, flush=True)
+        try:
+            pipeline.run("warmup")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[FusionEngine] prompt_guard first-inference warmup failed: {exc}",
+                file=sys.stderr,
+            )
+            return
+        inf_ms = int((time.time() - t_inf) * 1000)
+        print(
+            f"[FusionEngine] warm-up: first inference primed in {inf_ms}ms "
+            f"(total warm-up {load_ms + inf_ms}ms)",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def analyze(
         self,
@@ -672,6 +960,9 @@ class FusionEngine:
         user_id: str = "anonymous",
         tool_candidates: Optional[List[Dict[str, Any]]] = None,
         overrides: Optional[Dict[str, Any]] = None,
+        run_id: str = "live",
+        case_id: str = "",
+        target_id: str = "",
     ) -> FusionEngineResponse:
         """
         Run all 3 modules and fuse risk scores.
@@ -705,6 +996,7 @@ class FusionEngine:
             prompt_risk, rag_risk, agency_risk = self._run_parallel(
                 user_input, retrieved_context, retrieved_docs,
                 tool_call, user_id, role, enabled, tool_candidates,
+                live_run_id=run_id, live_case_id=case_id, live_target_id=target_id,
             )
         else:
             prompt_risk = (
@@ -716,6 +1008,9 @@ class FusionEngine:
                     retrieved_docs=retrieved_docs,
                     retrieved_context=retrieved_context,
                     user_query=user_input,
+                    live_run_id=run_id,
+                    live_case_id=case_id,
+                    live_target_id=target_id,
                 )
                 if enabled.get("rag_guard", True) else _disabled_module_risk("rag_guard")
             )
@@ -747,20 +1042,46 @@ class FusionEngine:
         elev_th = eff_override_cfg.get("elevated_threshold", 0.60)
         elev_mul = eff_override_cfg.get("elevated_multiplier", 0.85)
 
+        # Track pre-override fused so the decision trace can show the
+        # contribution of the max-rule override on its own line.
+        weighted_sum_value = fused
+        override_applied = "none"
         module_max = max(prompt_risk.risk_score, rag_risk.risk_score, agency_risk.risk_score)
         if module_max >= crit_th:
-            fused = max(fused, module_max * crit_mul)
+            new_fused = max(fused, module_max * crit_mul)
+            if new_fused > fused:
+                override_applied = "critical"
+            fused = new_fused
         elif module_max >= elev_th:
-            fused = max(fused, module_max * elev_mul)
+            new_fused = max(fused, module_max * elev_mul)
+            if new_fused > fused:
+                override_applied = "elevated"
+            fused = new_fused
 
         fused = round(min(fused, 1.0), 4)
 
-        final_decision = _threshold_decision_with(fused, eff_thresholds)
+        band = _threshold_decision_with(fused, eff_thresholds)
+        final_decision = _collapse_band(band)
 
         total_latency = int((time.time() - t0) * 1000)
 
+        # Hafta 12.1: per-call decision trace. Write only for real runs
+        # (non-"live" run_id) so the dashboard's Results page can drill
+        # into each block/sanitize decision. Best-effort — never breaks
+        # the request path.
+        _try_append_decision_trace(
+            run_id=run_id, case_id=case_id, target_id=target_id,
+            final_decision=final_decision, band=band, fused_risk=fused,
+            weighted_sum=weighted_sum_value, override_applied=override_applied,
+            eff_weights=eff_weights, eff_thresholds=eff_thresholds,
+            prompt_risk=prompt_risk, rag_risk=rag_risk, agency_risk=agency_risk,
+            output_risk=None,  # /analyze pre-LLM path has no output_guard
+            latency_ms=total_latency,
+        )
+
         return FusionEngineResponse(
             final_decision=final_decision,
+            decision_band=band,
             fused_risk=fused,
             module_risks=[
                 {"module": "prompt_guard", "risk_score": prompt_risk.risk_score,
@@ -786,9 +1107,36 @@ class FusionEngine:
         role: str,
         enabled: Dict[str, bool],
         tool_candidates: Optional[List[Dict[str, Any]]] = None,
-        timeout: int = 60,
+        timeout: Optional[int] = None,
+        *,
+        live_run_id: str = "live",
+        live_case_id: str = "",
+        live_target_id: str = "",
     ) -> tuple:
-        """Run enabled modules in parallel using ThreadPoolExecutor."""
+        """Run enabled modules in parallel using ThreadPoolExecutor.
+
+        Hafta 11: each module waits on its own per-module budget pulled from
+        `configs/timeout_config.yaml` (loaded once in __init__). When a
+        module times out or raises, the synthesised ModuleRisk reflects the
+        `on_timeout` policy (allow / sanitize / block) — fail-CLOSED by
+        default so a hung dependency can't silently downgrade detection.
+
+        `timeout` legacy kwarg (used to default to 60s) is honoured only
+        as a global ceiling — per-module budgets win when smaller.
+        """
+        # Resolve per-module timeouts from the profile. 0 = no budget
+        # enforced (helper convention); fall back to legacy ceiling.
+        profile = self._timeout_profile or {}
+        legacy_ceiling_s = float(timeout) if timeout else 60.0
+
+        def _module_timeout_s(module: str, default_s: float = legacy_ceiling_s) -> float:
+            ms = module_budget_ms(profile, module)
+            return (ms / 1000.0) if ms > 0 else default_s
+
+        timeout_prompt = _module_timeout_s("prompt_guard")
+        timeout_rag = _module_timeout_s("rag_guard")
+        timeout_agency = _module_timeout_s("output_agency")
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_prompt = None
             future_rag = None
@@ -801,26 +1149,63 @@ class FusionEngine:
                     retrieved_docs=retrieved_docs,
                     retrieved_context=retrieved_context,
                     user_query=user_input,
+                    live_run_id=live_run_id,
+                    live_case_id=live_case_id,
+                    live_target_id=live_target_id,
                 )
             if enabled.get("output_agency", True):
                 future_agency = executor.submit(
                     _max_agency_risk, tool_call, tool_candidates, user_id, role, user_input,
                 )
 
-            def _safe_result(future, module_name: str, disabled: ModuleRisk) -> ModuleRisk:
+            def _safe_result(
+                future,
+                module_name: str,
+                disabled: ModuleRisk,
+                timeout_s: float,
+            ) -> ModuleRisk:
+                """Fail-CLOSED on timeout/exception per `on_timeout` policy.
+
+                Synthesises a ModuleRisk with risk_score derived from the
+                policy (block→1.0, sanitize→0.5, allow→0.0). Evidence
+                carries the budget that was breached so audit logs can
+                trace why the module fell back. A telemetry ErrorEvent
+                emission is intentionally NOT added here — that belongs
+                in the downstream module (e.g. LLM judge) which has
+                richer context. _safe_result only owns the per-module
+                fail-CLOSED behaviour at the engine boundary.
+                """
                 if future is None:
                     return disabled
                 try:
-                    return future.result(timeout=timeout)
-                except Exception as e:
+                    return future.result(timeout=timeout_s)
+                except Exception as exc:
+                    policy = on_timeout_policy(profile, module_name, default="block")
+                    synth_risk = policy_risk_score(policy)
                     return ModuleRisk(
-                        module=module_name, risk_score=0.0, confidence=0.0,
-                        decision="allow", evidence=[f"Timeout/error: {e}"],
+                        module=module_name,
+                        risk_score=synth_risk,
+                        confidence=0.5,
+                        decision=policy,  # type: ignore[arg-type]
+                        evidence=[
+                            f"TIMEOUT: {module_name} exceeded "
+                            f"{int(timeout_s * 1000)}ms budget "
+                            f"(policy={policy}, error={type(exc).__name__})"
+                        ],
                     )
 
-            prompt_risk = _safe_result(future_prompt, "prompt_guard", _disabled_module_risk("prompt_guard"))
-            rag_risk = _safe_result(future_rag, "rag_guard", _disabled_module_risk("rag_guard"))
-            agency_risk = _safe_result(future_agency, "output_agency", _disabled_module_risk("output_agency"))
+            prompt_risk = _safe_result(
+                future_prompt, "prompt_guard",
+                _disabled_module_risk("prompt_guard"), timeout_prompt,
+            )
+            rag_risk = _safe_result(
+                future_rag, "rag_guard",
+                _disabled_module_risk("rag_guard"), timeout_rag,
+            )
+            agency_risk = _safe_result(
+                future_agency, "output_agency",
+                _disabled_module_risk("output_agency"), timeout_agency,
+            )
 
         return prompt_risk, rag_risk, agency_risk
 
@@ -849,6 +1234,9 @@ class FusionEngine:
         user_id: str = "anonymous",
         tool_candidates: Optional[List[Dict[str, Any]]] = None,
         overrides: Optional[Dict[str, Any]] = None,
+        run_id: str = "live",
+        case_id: str = "",
+        target_id: str = "",
     ) -> FusionEngineResponse:
         """Run all four modules (3 input-side + output_guard) and fuse.
 
@@ -882,11 +1270,19 @@ class FusionEngine:
             user_id=user_id,
             tool_candidates=tool_candidates,
             overrides=overrides,
+            run_id=run_id,
+            case_id=case_id,
+            target_id=target_id,
         )
 
         # Output guard — gated by config flag.
         if enabled.get("output_guard", True):
-            og_risk = _evaluate_output_guard(model_output)
+            og_risk = _evaluate_output_guard(
+                model_output,
+                live_run_id=run_id,
+                live_case_id=case_id,
+                live_target_id=target_id,
+            )
         else:
             og_risk = _disabled_module_risk("output_guard")
 
@@ -918,14 +1314,23 @@ class FusionEngine:
         crit_mul = eff_override_cfg.get("critical_multiplier", 0.90)
         elev_th = eff_override_cfg.get("elevated_threshold", 0.60)
         elev_mul = eff_override_cfg.get("elevated_multiplier", 0.85)
+        weighted_sum_value = fused
+        override_applied = "none"
         module_max = max(scores.values())
         if module_max >= crit_th:
-            fused = max(fused, module_max * crit_mul)
+            new_fused = max(fused, module_max * crit_mul)
+            if new_fused > fused:
+                override_applied = "critical"
+            fused = new_fused
         elif module_max >= elev_th:
-            fused = max(fused, module_max * elev_mul)
+            new_fused = max(fused, module_max * elev_mul)
+            if new_fused > fused:
+                override_applied = "elevated"
+            fused = new_fused
         fused = round(min(fused, 1.0), 4)
 
-        final_decision = _threshold_decision_with(fused, eff_thresholds)
+        band = _threshold_decision_with(fused, eff_thresholds)
+        final_decision = _collapse_band(band)
         total_latency = int((time.time() - t0) * 1000)
 
         module_risks = list(input_side.module_risks) + [{
@@ -937,8 +1342,34 @@ class FusionEngine:
             "latency_ms": og_risk.latency_ms,
         }]
 
+        # Hafta 12.1: write decision trace for analyze_with_output path too.
+        # Reconstruct ModuleRisk objects for the 3 input-side modules from
+        # the dicts that analyze() returned (cheap; avoids a second pass).
+        def _from_dict(d: Dict[str, Any], name: str) -> ModuleRisk:
+            return ModuleRisk(
+                module=name,
+                risk_score=float(d.get("risk_score", 0.0)),
+                confidence=float(d.get("confidence", 0.0)),
+                decision=d.get("decision", "allow"),  # type: ignore[arg-type]
+                evidence=list(d.get("evidence") or []),
+                latency_ms=int(d.get("latency_ms") or 0),
+            )
+
+        _try_append_decision_trace(
+            run_id=run_id, case_id=case_id, target_id=target_id,
+            final_decision=final_decision, band=band, fused_risk=fused,
+            weighted_sum=weighted_sum_value, override_applied=override_applied,
+            eff_weights=eff_weights, eff_thresholds=eff_thresholds,
+            prompt_risk=_from_dict(prompt_d, "prompt_guard"),
+            rag_risk=_from_dict(rag_d, "rag_guard"),
+            agency_risk=_from_dict(agency_d, "output_agency"),
+            output_risk=og_risk,
+            latency_ms=total_latency,
+        )
+
         return FusionEngineResponse(
             final_decision=final_decision,
+            decision_band=band,
             fused_risk=fused,
             module_risks=module_risks,
             latency_ms=total_latency,
