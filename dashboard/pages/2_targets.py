@@ -31,6 +31,108 @@ st.caption(
 client = get_default_client()
 
 
+def _parse_json_object(label: str, raw: str) -> dict | None:
+    """Parse a JSON object from a form text-area. Empty → empty dict.
+
+    Surfaces a user-visible st.error and returns sentinel `None` on
+    parse failure so the caller can short-circuit the save. Non-object
+    JSON (lists, scalars) is rejected — headers must be a flat object.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        st.error(f"{label} is not valid JSON: {exc}")
+        return None
+    if not isinstance(parsed, dict):
+        st.error(f"{label} must be a JSON object, got {type(parsed).__name__}")
+        return None
+    # Coerce values to strings — Pydantic AuthHeader.headers is Dict[str, str].
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _assemble_auth_payload(
+    *,
+    auth_type: str,
+    token_env: str, token_inline: str,
+    headers_raw: str,
+    query_key: str,
+    query_value_env: str, query_value_inline: str,
+    basic_user: str, basic_user_env: str,
+    basic_pass_env: str,
+    extra_headers_raw: str,
+) -> dict | None:
+    """Build the `auth` dict to send in the POST/PATCH payload.
+
+    Returns `None` when the form is in an invalid state (a st.error has
+    already been emitted) — caller should st.stop() in that case.
+    Returns `{}` to signal "send no auth field" (server applies AuthNone).
+    """
+    extra_headers = _parse_json_object("auth.extra_headers", extra_headers_raw)
+    if extra_headers is None:
+        return None
+
+    if auth_type == "none":
+        # Always send `auth.type=none` so the backend round-trips cleanly
+        # even when extra_headers is non-empty.
+        return {"type": "none", "extra_headers": extra_headers}
+
+    if auth_type == "bearer":
+        if not (token_env or token_inline):
+            st.error("bearer auth: provide either `auth.token_env` or `auth.token`.")
+            return None
+        body: dict = {"type": "bearer", "extra_headers": extra_headers}
+        if token_env:
+            body["token_env"] = token_env
+        if token_inline:
+            body["token"] = token_inline
+        return body
+
+    if auth_type == "header":
+        headers = _parse_json_object("auth.headers", headers_raw)
+        if headers is None:
+            return None
+        if not headers:
+            st.error("header auth: `auth.headers` cannot be empty.")
+            return None
+        return {"type": "header", "headers": headers, "extra_headers": extra_headers}
+
+    if auth_type == "query":
+        if not query_key:
+            st.error("query auth: `auth.query_key` is required (e.g. `key`).")
+            return None
+        if not (query_value_env or query_value_inline):
+            st.error("query auth: provide `auth.query_value_env` or `auth.query_value`.")
+            return None
+        body = {"type": "query", "query_key": query_key, "extra_headers": extra_headers}
+        if query_value_env:
+            body["query_value_env"] = query_value_env
+        if query_value_inline:
+            body["query_value"] = query_value_inline
+        return body
+
+    if auth_type == "basic":
+        if not (basic_user or basic_user_env):
+            st.error("basic auth: provide `auth.username` or `auth.username_env`.")
+            return None
+        if not basic_pass_env:
+            st.error("basic auth: `auth.password_env` is required (no inline password input).")
+            return None
+        body = {"type": "basic", "extra_headers": extra_headers}
+        if basic_user:
+            body["username"] = basic_user
+        if basic_user_env:
+            body["username_env"] = basic_user_env
+        body["password_env"] = basic_pass_env
+        return body
+
+    # Unknown / future type — surface and bail.
+    st.error(f"unsupported auth.type {auth_type!r}")
+    return None
+
+
 def _load_targets(enabled_only: bool):
     payload = client.get_json("/targets", params={"enabled_only": str(enabled_only).lower()}) or {}
     return payload.get("targets") or []
@@ -148,9 +250,29 @@ if target_type == "api":
 
 # Common form-time defaults derived from prefill regardless of type.
 _auth_pf = _pf.get("auth") or {}
-_auth_type_opts = ["none", "bearer", "header", "basic"]
+# Hafta 11.2: 5-tip discriminated union. `auth_type` selectbox lives
+# OUTSIDE the form so changing it re-renders the matching widget group
+# immediately (form widgets freeze until submit).
+_auth_type_opts = ["none", "bearer", "header", "query", "basic"]
 _auth_type_val = _auth_pf.get("type") or "none"
 _auth_type_idx = _auth_type_opts.index(_auth_type_val) if _auth_type_val in _auth_type_opts else 0
+# Render the auth-type selector only for target types that consume auth
+# (api / web). Mock targets ignore it. The variable is referenced
+# unconditionally further down, so initialise to "none" first.
+auth_type = "none"
+if target_type in ("api", "web"):
+    auth_type = st.selectbox(
+        "auth.type",
+        _auth_type_opts,
+        index=_auth_type_idx,
+        help=(
+            "none   = open endpoint, no credentials. "
+            "bearer = Authorization: Bearer <token> (e.g. OpenAI, internal JWT). "
+            "header = arbitrary header(s) (e.g. X-API-Key). "
+            "query  = `?key=...` query-param auth (e.g. Gemini). "
+            "basic  = HTTP Basic auth."
+        ),
+    )
 
 _rt_default = (
     json.dumps(_pf["request_template"], indent=2)
@@ -191,8 +313,19 @@ with st.form("upsert_target"):
     sel_response = ""
     sel_submit = ""
     response_wait_ms = 3000
-    auth_type = "none"
+    # Hafta 11.2 auth-related widget defaults. Populated below depending on
+    # the (outside-form) `auth_type` value. `auth_type` itself is already
+    # set above; what we collect here are the per-variant inputs.
     auth_token_env = ""
+    auth_token_inline = ""
+    auth_headers_raw = ""
+    auth_query_key = ""
+    auth_query_value_env = ""
+    auth_query_value_inline = ""
+    auth_basic_user = ""
+    auth_basic_user_env = ""
+    auth_basic_pass_env = ""
+    auth_extra_headers_raw = ""
 
     if target_type == "api":
         st.markdown(f"### API target ({http_method})")
@@ -233,13 +366,79 @@ with st.form("upsert_target"):
             ),
         )
 
-        st.markdown("**Auth**")
-        auth_type = st.selectbox("auth.type", _auth_type_opts, index=_auth_type_idx)
-        auth_token_env = st.text_input(
-            "auth.token_env (env-var name; the actual value is never sent here)",
-            value=_auth_pf.get("token_env") or "",
-            placeholder="CHATBOT_BEARER_TOKEN",
-            disabled=auth_type == "none",
+        # Hafta 11.2: 5-type auth block. `auth_type` already selected
+        # outside the form; render only the matching variant's inputs +
+        # the shared extra_headers editor.
+        st.markdown(f"**Auth** (`type={auth_type}`)")
+        if auth_type == "bearer":
+            auth_token_env = st.text_input(
+                "auth.token_env  (env-var name; **the secret never enters the form**)",
+                value=_auth_pf.get("token_env") or "",
+                placeholder="OPENAI_API_KEY",
+                help="Adapter reads os.environ[<this>] at request time.",
+            )
+            auth_token_inline = st.text_input(
+                "auth.token  (legacy / tests — prefer token_env)",
+                value="",  # never prefill; redacted on read
+                placeholder="leave blank if using token_env",
+                type="password",
+            )
+        elif auth_type == "header":
+            _pf_headers = _auth_pf.get("headers") or {}
+            auth_headers_raw = st.text_area(
+                "auth.headers  (JSON object — key→value)",
+                value=json.dumps(_pf_headers, indent=2) if _pf_headers else "",
+                placeholder='{"X-API-Key": "${MY_KEY_ENV}"}',
+                help="Static headers added on every request. Use ${ENV} to interpolate at runtime (future enhancement; for now hard-code or use env-substitution at YAML load).",
+            )
+        elif auth_type == "query":
+            auth_query_key = st.text_input(
+                "auth.query_key",
+                value=_auth_pf.get("query_key") or "",
+                placeholder="key",
+                help="Query param name appended to every request URL (e.g. `key` for Gemini).",
+            )
+            auth_query_value_env = st.text_input(
+                "auth.query_value_env",
+                value=_auth_pf.get("query_value_env") or "",
+                placeholder="GEMINI_API_KEY",
+                help="Env-var holding the secret value.",
+            )
+            auth_query_value_inline = st.text_input(
+                "auth.query_value  (legacy / tests — prefer query_value_env)",
+                value="",
+                placeholder="leave blank if using query_value_env",
+                type="password",
+            )
+        elif auth_type == "basic":
+            cBA, cBB = st.columns(2)
+            auth_basic_user = cBA.text_input(
+                "auth.username  (inline)",
+                value=_auth_pf.get("username") or "",
+            )
+            auth_basic_user_env = cBB.text_input(
+                "auth.username_env",
+                value=_auth_pf.get("username_env") or "",
+            )
+            auth_basic_pass_env = st.text_input(
+                "auth.password_env  (no inline password input — use an env-var)",
+                value=_auth_pf.get("password_env") or "",
+                placeholder="MY_BASIC_PASSWORD_ENV",
+            )
+
+        # Shared across all types: extra static headers (OpenAI org id,
+        # tenant id, Cloudflare access headers, …). Visible even when
+        # auth.type=none so open endpoints can still pin custom headers.
+        _pf_extra = _auth_pf.get("extra_headers") or {}
+        auth_extra_headers_raw = st.text_area(
+            "auth.extra_headers  (JSON object — optional, attached on every request)",
+            value=json.dumps(_pf_extra, indent=2) if _pf_extra else "",
+            placeholder='{"OpenAI-Organization": "org-xyz"}',
+            help=(
+                "Static headers merged onto every request regardless of "
+                "auth.type. Use for vendor-specific identifiers like "
+                "OpenAI-Organization, X-Tenant-Id, Accept-Version pinning."
+            ),
         )
 
     elif target_type == "web":
@@ -274,12 +473,21 @@ with st.form("upsert_target"):
             help="Delay between submit and response read; covers token streaming.",
         )
 
-        st.markdown("**Auth**")
-        auth_type = st.selectbox("auth.type", _auth_type_opts, index=_auth_type_idx)
-        auth_token_env = st.text_input(
-            "auth.token_env",
-            value=_auth_pf.get("token_env") or "",
-            disabled=auth_type == "none",
+        # Web targets honour auth.extra_headers (e.g. Cloudflare Access)
+        # but the Playwright adapter doesn't apply bearer/header/query
+        # itself. Surface the extra_headers field; the rest is informational.
+        st.markdown(f"**Auth** (`type={auth_type}`)")
+        if auth_type != "none":
+            st.caption(
+                "ℹ️ Web (Playwright) adapter currently applies only "
+                "`extra_headers`. bearer / header / query / basic auth is "
+                "API-only for now."
+            )
+        _pf_extra = _auth_pf.get("extra_headers") or {}
+        auth_extra_headers_raw = st.text_area(
+            "auth.extra_headers  (JSON object — optional)",
+            value=json.dumps(_pf_extra, indent=2) if _pf_extra else "",
+            placeholder='{"Accept-Language": "en-US"}',
         )
 
     elif target_type == "mock":
@@ -362,10 +570,21 @@ if target_type == "api":
     if rp_text:
         payload["response_path"] = rp_text
 
-    if auth_type != "none":
-        payload["auth"] = {"type": auth_type}
-        if auth_token_env:
-            payload["auth"]["token_env"] = auth_token_env
+    # Hafta 11.2: build auth payload from the variant's inputs. The
+    # discriminated union validator will reject incomplete shapes
+    # (e.g. bearer with no token sources, query with no value).
+    auth_payload = _assemble_auth_payload(
+        auth_type=auth_type,
+        token_env=auth_token_env, token_inline=auth_token_inline,
+        headers_raw=auth_headers_raw,
+        query_key=auth_query_key,
+        query_value_env=auth_query_value_env, query_value_inline=auth_query_value_inline,
+        basic_user=auth_basic_user, basic_user_env=auth_basic_user_env,
+        basic_pass_env=auth_basic_pass_env,
+        extra_headers_raw=auth_extra_headers_raw,
+    )
+    if auth_payload is not None:
+        payload["auth"] = auth_payload
 
 elif target_type == "web":
     if not endpoint:
@@ -388,10 +607,21 @@ elif target_type == "web":
         selectors["submit"] = submit_sel
     payload["selectors"] = selectors
 
-    if auth_type != "none":
-        payload["auth"] = {"type": auth_type}
-        if auth_token_env:
-            payload["auth"]["token_env"] = auth_token_env
+    # Hafta 11.2: build auth payload from the variant's inputs. The
+    # discriminated union validator will reject incomplete shapes
+    # (e.g. bearer with no token sources, query with no value).
+    auth_payload = _assemble_auth_payload(
+        auth_type=auth_type,
+        token_env=auth_token_env, token_inline=auth_token_inline,
+        headers_raw=auth_headers_raw,
+        query_key=auth_query_key,
+        query_value_env=auth_query_value_env, query_value_inline=auth_query_value_inline,
+        basic_user=auth_basic_user, basic_user_env=auth_basic_user_env,
+        basic_pass_env=auth_basic_pass_env,
+        extra_headers_raw=auth_extra_headers_raw,
+    )
+    if auth_payload is not None:
+        payload["auth"] = auth_payload
 
 # mock: only common fields are sent — the backend default for empty
 # auth/endpoint/template covers it.

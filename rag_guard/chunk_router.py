@@ -50,6 +50,13 @@ class RouteDecision:
     judge_score: Optional[float] = None
     used_override: bool = False
     text_preview: str = ""
+    # Hafta 12.2: per-chunk timing for routing cost analytics. Set by the
+    # pipeline as it executes each stage. Stays 0 when the stage doesn't
+    # run (e.g. embedding_time_ms is always set; judge_time_ms is 0 for
+    # SKIP chunks, populated for FAST/DEEP). The explainability log
+    # surfaces these alongside the route + score.
+    embedding_time_ms: int = 0
+    judge_time_ms: int = 0
 
 
 @dataclass
@@ -143,6 +150,38 @@ class ChunkRouter:
             if d.used_override:
                 counts["overrides"] += 1
         return counts
+
+    @staticmethod
+    def cost_breakdown(decisions: List[RouteDecision]) -> Dict[str, float]:
+        """Aggregate routing cost stats for `rag_final_metrics.csv` and
+        the dashboard Performance tab.
+
+        Returns:
+            total_chunks_evaluated  — `len(decisions)`
+            total_llm_judge_calls   — FAST + DEEP (SKIP avoids the judge)
+            routing_savings_pct     — `skip / total * 100` (0 when empty)
+            embedding_phase_ms      — sum of per-chunk embedding times
+            judge_phase_ms          — sum of per-chunk judge times
+
+        All values are floats so the writer formats them consistently.
+        Division by zero is guarded explicitly because an empty doc set
+        is a legitimate state (early return from the pipeline).
+        """
+        n = len(decisions)
+        skip = sum(1 for d in decisions if d.route == Route.SKIP)
+        judge_calls = sum(
+            1 for d in decisions
+            if d.route in (Route.FAST_JUDGE, Route.DEEP_JUDGE)
+        )
+        emb_ms = sum(int(d.embedding_time_ms or 0) for d in decisions)
+        jud_ms = sum(int(d.judge_time_ms or 0) for d in decisions)
+        return {
+            "total_chunks_evaluated": float(n),
+            "total_llm_judge_calls": float(judge_calls),
+            "routing_savings_pct": (skip / n * 100.0) if n > 0 else 0.0,
+            "embedding_phase_ms": float(emb_ms),
+            "judge_phase_ms": float(jud_ms),
+        }
 
 
 __all__ = ["ChunkRouter", "RouterConfig", "Route", "RouteDecision"]

@@ -25,6 +25,19 @@ PyYAML>=6.0
 fastapi>=0.100
 uvicorn[standard]>=0.22
 requests>=2.28
+httpx>=0.24
+
+# Tool execution (Hafta 14):
+# simpleeval is an AST-restricted expression evaluator — never eval()/exec().
+# `tools/calculator.py` falls back to a hand-rolled walker if absent, but
+# we ship simpleeval explicitly so demo runs use the maintained library.
+simpleeval>=0.9
+
+# Evaluation report generation (Hafta 15):
+# matplotlib used by scripts/generate_thesis_report.py to render the
+# charts that ship as PNG attachments next to the markdown / PDF report.
+# Headless Agg backend so it works in Docker without an X server.
+matplotlib>=3.5
 
 # Sandbox execution (Docker SDK)
 docker>=7.0

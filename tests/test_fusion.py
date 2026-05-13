@@ -32,6 +32,9 @@ from fusion_gateway.engine import (
         (eng.DEFAULT_THRESHOLDS["allow"] - 1e-6, "allow"),
         (eng.DEFAULT_THRESHOLDS["allow"], "sanitize"),
         (eng.DEFAULT_THRESHOLDS["sanitize"] - 1e-6, "sanitize"),
+        # The [sanitize, block) band keeps the granular `flag` label —
+        # surfaced via `decision_band` for audit. The gateway final_decision
+        # collapses flag→block via _collapse_band; tested separately below.
         (eng.DEFAULT_THRESHOLDS["sanitize"], "flag"),
         (eng.DEFAULT_THRESHOLDS["block"] - 1e-6, "flag"),
         (eng.DEFAULT_THRESHOLDS["block"], "block"),
@@ -40,6 +43,15 @@ from fusion_gateway.engine import (
 )
 def test_threshold_decision_buckets(score, expected):
     assert _threshold_decision(score) == expected
+
+
+def test_collapse_band_flag_becomes_block():
+    """flag is suspicion-tier block: gateway final_decision must be 'block'
+    while the granular band stays 'flag' for audit trail."""
+    assert eng._collapse_band("allow") == "allow"
+    assert eng._collapse_band("sanitize") == "sanitize"
+    assert eng._collapse_band("flag") == "block"
+    assert eng._collapse_band("block") == "block"
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +209,9 @@ def test_response_to_dict_shape(monkeypatch):
     _stub_evaluators(monkeypatch, p=0.10)
     resp = _engine_serial().analyze(user_input="x")
     d = resp.to_dict()
-    assert set(d.keys()) == {"final_decision", "fused_risk", "module_risks", "latency_ms"}
+    assert set(d.keys()) == {
+        "final_decision", "decision_band", "fused_risk", "module_risks", "latency_ms"
+    }
     assert len(d["module_risks"]) == 3
     names = {m["module"] for m in d["module_risks"]}
     assert names == {"prompt_guard", "rag_guard", "output_agency"}

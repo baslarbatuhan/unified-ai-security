@@ -34,10 +34,51 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# Hafta 11: timeout config + circuit breaker + telemetry for fail-CLOSED
+# behaviour. All best-effort imports — judge stays functional on minimal
+# installs (e.g. CI without configs/) by falling back to legacy timeout.
+try:
+    from configs.timeout_loader import (
+        load_timeout_profile,
+        llm_judge_budget_ms,
+    )
+except Exception:  # noqa: BLE001 — broad on purpose, optional dep
+    load_timeout_profile = None  # type: ignore[assignment]
+    llm_judge_budget_ms = None   # type: ignore[assignment]
+
+try:
+    from utils.fallback_handler import (
+        get_breaker,
+        CircuitOpenError,
+    )
+except Exception:  # noqa: BLE001
+    get_breaker = None           # type: ignore[assignment]
+    CircuitOpenError = Exception  # type: ignore[misc,assignment]
+
+try:
+    from schemas.telemetry_schema import emit_telemetry, ErrorEvent
+except Exception:  # noqa: BLE001
+    emit_telemetry = None        # type: ignore[assignment]
+    ErrorEvent = None            # type: ignore[assignment]
+
 try:
     import requests
 except ImportError:
     requests = None
+
+
+def _is_timeout_exc(exc: BaseException) -> bool:
+    """True when `exc` is a network/socket timeout. Tolerant of `requests`
+    being absent (CI without HTTP libs) — falls back to class-name match."""
+    if requests is not None:
+        try:
+            if isinstance(exc, requests.exceptions.Timeout):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    # Final fallback: name-based match so socket.timeout etc. still surface
+    # as timeouts in logs even without `requests` introspection.
+    return "timeout" in type(exc).__name__.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -161,22 +202,52 @@ class LLMJudge:
         model: str = DEFAULT_MODEL,
         fallback_model: str = FALLBACK_MODEL,
         fallback_model_2: str = FALLBACK_MODEL_2,
-        timeout: int = 30,
+        timeout: Optional[int] = None,
         temperature: float = 0.0,
         seed: int = 42,
         num_ctx: int = 2048,
         num_keep: int = 0,
+        timeout_profile: str = "standard",
+        breaker_name: str = "ollama_llm_judge",
     ):
         self.ollama_host = ollama_host.rstrip("/")
         self.model = model
         self.fallback_model = fallback_model
         self.fallback_model_2 = fallback_model_2
-        self.timeout = timeout
+        # Hafta 11: per-call timeout from config (llm_judge_ms). Explicit
+        # `timeout=` arg wins for tests + legacy callers; otherwise pull
+        # from the active profile. Hardcoded 30s only as last-resort
+        # fallback when configs/ is missing entirely.
+        if timeout is not None:
+            self.timeout = int(timeout)
+        else:
+            self.timeout = self._resolve_timeout_from_profile(timeout_profile, default=30)
         self.temperature = temperature
         self.seed = seed
         self.num_ctx = num_ctx
         self.num_keep = num_keep
         self._active_model: Optional[str] = None
+        # Per-host breaker so two judges pointed at different Ollama hosts
+        # don't share circuit state. Falls back to None when utils/ import
+        # failed (minimal install) — call sites then go direct.
+        self._breaker = None
+        if get_breaker is not None:
+            try:
+                self._breaker = get_breaker(breaker_name)
+            except Exception:  # noqa: BLE001
+                self._breaker = None
+
+    @staticmethod
+    def _resolve_timeout_from_profile(profile_name: str, default: int = 30) -> int:
+        """Look up llm_judge_ms in the timeout profile; convert to seconds."""
+        if load_timeout_profile is None or llm_judge_budget_ms is None:
+            return default
+        try:
+            profile = load_timeout_profile(profile_name)
+            ms = llm_judge_budget_ms(profile, default_ms=default * 1000)
+            return max(1, int(ms / 1000))
+        except Exception:  # noqa: BLE001 — config missing → legacy default
+            return default
 
     def _check_model_available(self, model: str) -> bool:
         """Check if a model is available in Ollama."""
@@ -236,15 +307,21 @@ class LLMJudge:
             },
         }
 
-        resp = requests.post(
-            f"{self.ollama_host}/api/chat",
-            json=payload,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
+        def _do_post() -> str:
+            r = requests.post(
+                f"{self.ollama_host}/api/chat",
+                json=payload,
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return r.json().get("message", {}).get("content", "")
 
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
+        # Hafta 11: route through the circuit breaker when available so
+        # repeated Ollama failures short-circuit instead of stacking
+        # timeouts. Direct call when breaker is unavailable (test/CI).
+        if self._breaker is not None:
+            return self._breaker.call(_do_post)
+        return _do_post()
 
     def _parse_response(self, raw: str) -> Dict:
         """Parse LLM response into structured result.
@@ -357,6 +434,36 @@ class LLMJudge:
 
         except Exception as e:
             latency_ms = int((time.time() - t0) * 1000)
+            # Hafta 11: classify the failure mode so downstream consumers
+            # (pipeline.py embedding-only fallback, dashboard evidence)
+            # can tell a timeout apart from a circuit-open short-circuit
+            # apart from a parse/network error. Keep the raw `error`
+            # string for backward compat.
+            err_str = str(e) or type(e).__name__
+            if isinstance(e, CircuitOpenError):
+                error_type = "CircuitOpenError"
+                err_str = f"circuit_open: {err_str}"
+            elif _is_timeout_exc(e):
+                error_type = "TimeoutError"
+                err_str = f"timeout: {err_str}"
+            else:
+                error_type = type(e).__name__
+
+            # Structured telemetry so timeouts show up in /dashboard/recent
+            # event tail and in any alert rule keyed on `error` kind. Wrapped
+            # so a telemetry sink failure can never break the judge path.
+            if emit_telemetry is not None and ErrorEvent is not None:
+                try:
+                    emit_telemetry(ErrorEvent(
+                        run_id="live",
+                        where="rag_guard.llm_judge.analyze",
+                        error_type=error_type,
+                        message=err_str[:300],
+                        details={"doc_id": doc_id, "latency_ms": latency_ms},
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+
             return JudgeResult(
                 doc_id=doc_id,
                 is_suspicious=False,
@@ -365,7 +472,7 @@ class LLMJudge:
                 explanation="",
                 model_used=self.model,
                 latency_ms=latency_ms,
-                error=str(e),
+                error=err_str,
             )
 
     @staticmethod

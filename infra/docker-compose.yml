@@ -39,6 +39,10 @@ services:
       - CHROMA_PORT=8000
       - HF_HOME=/app/.cache/huggingface
       - EMBEDDING_DEVICE=cpu
+      # Hafta 15: eager-load the prompt_guard pipeline at FusionEngine
+      # init so the first /analyze request doesn't pay the BGE-M3
+      # warm-up cost (~11s on CPU) inside its timeout budget.
+      - UAIS_WARM_UP_PIPELINES=1
       # Same secret; both names are read by huggingface_hub / transformers
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
@@ -46,6 +50,7 @@ services:
       # configures `auth.token_env=OPENAI_API_KEY` (etc.) on a target.
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - CHATBOT_BEARER_TOKEN=${CHATBOT_BEARER_TOKEN:-}
     volumes:
       - hf_cache:/app/.cache/huggingface
@@ -92,6 +97,14 @@ services:
       # the dashboard to talk to a host-side gateway instead.
       - GATEWAY_URL=${GATEWAY_URL:-http://gateway:8000}
       - GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-120}
+    volumes:
+      # Shared with the gateway: pages 5_results / 7_logs read CSVs from
+      # `runs/`, AND page 3_run_test writes a snapshot to
+      # `runs/<run_id>/config_used.yaml` before POSTing to /runs/start
+      # (utils/config_builder.write_snapshot). Must be writable.
+      # targets.yaml stays read-only — CRUD goes through the gateway API.
+      - ../runs:/app/runs
+      - ../external_eval/targets.yaml:/app/external_eval/targets.yaml:ro
     command:
       - streamlit
       - run

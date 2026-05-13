@@ -17,12 +17,122 @@ Validation rules (enforced):
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing_extensions import Annotated
 
 
-TargetType = Literal["api", "web", "mock"]
+TargetType = Literal["api", "web", "mock", "tools_local"]
+
+
+# ---------------------------------------------------------------------------
+# Hafta 11.2 — Auth discriminated union
+# ---------------------------------------------------------------------------
+# Five auth shapes, validated by `type` literal. Each carries an optional
+# `extra_headers: Dict[str, str]` that is appended unconditionally — useful
+# for OpenAI's `OpenAI-Organization`, Cloudflare's `CF-Access-Client-Id`,
+# multi-tenant `X-Tenant-Id`, etc. The discriminator lets adapters dispatch
+# cleanly without ad-hoc dict probing.
+#
+# Backward compat: legacy `auth: {}` is normalised to `AuthNone()` by
+# `TargetConfig._normalize_auth`. Existing `auth: {type: bearer, token_env: X}`
+# entries validate as `AuthBearer` unchanged.
+
+
+class _AuthBase(BaseModel):
+    extra_headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Static headers attached regardless of auth type. "
+            "Examples: OpenAI org id, multi-tenant id, custom Accept-Version."
+        ),
+    )
+
+
+class AuthNone(_AuthBase):
+    """No auth — open endpoint or test mock."""
+
+    type: Literal["none"] = "none"
+
+
+class AuthBearer(_AuthBase):
+    """Bearer token. Prefer `token_env` (env-var lookup) over inline `token`."""
+
+    type: Literal["bearer"]
+    token_env: Optional[str] = Field(default=None, description="Env var holding the token.")
+    token: Optional[str] = Field(
+        default=None,
+        description="Inline token (legacy / tests only — prefer token_env).",
+    )
+
+    @model_validator(mode="after")
+    def _need_one_source(self) -> "AuthBearer":
+        if not (self.token_env or self.token):
+            raise ValueError("bearer auth requires `token_env` or `token`")
+        return self
+
+
+class AuthHeader(_AuthBase):
+    """Arbitrary header injection — for vendors that need a custom scheme."""
+
+    type: Literal["header"]
+    headers: Dict[str, str] = Field(
+        ...,
+        description="Headers added to every request (e.g. X-API-Key: ...).",
+    )
+
+    @model_validator(mode="after")
+    def _need_headers(self) -> "AuthHeader":
+        if not self.headers:
+            raise ValueError("header auth requires non-empty `headers`")
+        return self
+
+
+class AuthQuery(_AuthBase):
+    """Query-param auth — e.g. Gemini `?key=...`."""
+
+    type: Literal["query"]
+    query_key: str = Field(..., min_length=1, description="Param name (e.g. 'key').")
+    query_value: Optional[str] = Field(
+        default=None, description="Inline value (legacy / tests)."
+    )
+    query_value_env: Optional[str] = Field(
+        default=None, description="Env var holding the value."
+    )
+
+    @model_validator(mode="after")
+    def _need_one_source(self) -> "AuthQuery":
+        if not (self.query_value or self.query_value_env):
+            raise ValueError("query auth requires `query_value` or `query_value_env`")
+        return self
+
+
+class AuthBasic(_AuthBase):
+    """HTTP Basic — username + password (env-var preferred)."""
+
+    type: Literal["basic"]
+    username: Optional[str] = None
+    username_env: Optional[str] = None
+    password: Optional[str] = None
+    password_env: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _need_credentials(self) -> "AuthBasic":
+        has_user = bool(self.username or self.username_env)
+        has_pass = bool(self.password or self.password_env)
+        if not (has_user and has_pass):
+            raise ValueError(
+                "basic auth requires (username or username_env) AND "
+                "(password or password_env)"
+            )
+        return self
+
+
+AuthConfig = Annotated[
+    Union[AuthNone, AuthBearer, AuthHeader, AuthQuery, AuthBasic],
+    Field(discriminator="type"),
+]
 
 
 class WebSelectors(BaseModel):
@@ -75,10 +185,25 @@ class TargetConfig(BaseModel):
         ),
     )
 
-    # Authentication is vendor-shaped; we accept any dict and let the adapter
-    # interpret it (`{"type": "bearer", "token": "..."}`,
-    # `{"type": "header", "headers": {...}}`, etc.)
-    auth: Dict[str, Any] = Field(default_factory=dict)
+    # Authentication — discriminated union (Hafta 11.2). Legacy `auth: {}`
+    # is normalised to `AuthNone` by the validator below so existing
+    # targets.yaml entries keep loading without changes.
+    auth: AuthConfig = Field(default_factory=lambda: AuthNone())
+
+    @field_validator("auth", mode="before")
+    @classmethod
+    def _normalize_auth(cls, v: Any) -> Any:
+        """Pre-validation: tolerate legacy shapes.
+
+        - `None` / empty dict / empty string → `{"type": "none"}`
+        - Dict missing `type` → assume `none` (closed-by-default, no auth header)
+        - Anything else passes through to the discriminator.
+        """
+        if v is None or v == "" or v == {}:
+            return {"type": "none"}
+        if isinstance(v, dict) and "type" not in v:
+            return {**v, "type": "none"}
+        return v
 
     # API-only
     http_method: Literal["POST", "GET"] = Field(
@@ -168,4 +293,10 @@ __all__ = [
     "RateLimit",
     "TargetConfig",
     "TargetsFile",
+    "AuthConfig",
+    "AuthNone",
+    "AuthBearer",
+    "AuthHeader",
+    "AuthQuery",
+    "AuthBasic",
 ]

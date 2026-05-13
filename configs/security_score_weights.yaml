@@ -1,0 +1,32 @@
+# configs/security_score_weights.yaml
+# =====================================
+# Composite security score formula tuning.
+#
+# Used by `dashboard.lib.recommendations.composite_security_score` and
+# the thesis report generator (single source of truth). Default values
+# preserve the Hafta 13 hardcoded formula:
+#
+#     score = 100 × (1 − miss_rate)^miss_w
+#                 × (1 − latency_breach_rate)^latency_w
+#                 × max(precision × recall, neutral_when_zero)^quality_w
+#
+# Exponents (`*_weight`) default to 1.0 — multiplicative formula
+# unchanged. Operators tightening one axis (e.g. recall matters more
+# than latency) can raise the corresponding weight; ignoring an axis is
+# weight = 0.0 (the factor becomes 1 = neutral). All weights ≥ 0.
+
+# Multiplicative exponents per factor. >1 amplifies penalties, <1
+# softens them, 0 disables the factor entirely.
+weights:
+  miss: 1.0              # miss_rate penalty
+  latency: 1.0           # latency_breach_rate penalty
+  quality: 1.0           # precision × recall penalty
+
+# When precision AND recall are both 0, the system probably hasn't been
+# evaluated yet — we don't punish that ("unknown" ≠ "bad"). True keeps
+# the neutral fallback; False treats 0×0 as actual zero quality.
+treat_zero_precision_recall_as_neutral: true
+
+# Score is clipped to [0, 100] regardless. Set the max here if a future
+# operator wants a different ceiling (rare).
+max_score: 100.0

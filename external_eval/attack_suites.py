@@ -45,6 +45,21 @@ class AttackCase:
     category: str = ""
     requires_tools: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # When set, the runner forwards these to FusionEngine.analyze so the
+    # rag_guard branch sees a real document and the live writer fires.
+    # `prompt` stays as the merged form (poisoned doc + question) for the
+    # external chatbot adapter, which has no separate context channel.
+    gateway_user_input: Optional[str] = None
+    gateway_retrieved_context: Optional[str] = None
+    # agency_social cases: scenarios encode a structured tool call (tool +
+    # args + user_id + role). The adapter receives a natural-language
+    # prompt that asks the chatbot to invoke that tool, but the gateway's
+    # agency module needs the raw tool_call dict — without it the agency
+    # branch returns risk_score=0.0 ("No tool call") and the run is
+    # silently dimensioned only on prompt_guard.
+    gateway_tool_call: Optional[Dict[str, Any]] = None
+    gateway_user_id: Optional[str] = None
+    gateway_role: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +134,12 @@ def load_rag_poisoning(limit: Optional[int] = None) -> List[AttackCase]:
                     "technique": doc.get("poison_technique"),
                     "target_query": q,
                 },
+                # Adapter sees the merged prompt (no separate context channel
+                # on external chatbots). Gateway gets the bare query as user
+                # input and the poisoned doc as retrieved_context — that is
+                # what would happen if a real RAG system retrieved this doc.
+                gateway_user_input=q,
+                gateway_retrieved_context=doc["content"],
             )
         )
         if limit is not None and len(cases) >= limit:
@@ -166,6 +187,13 @@ def load_agency_social(limit: Optional[int] = None) -> List[AttackCase]:
                     "args": s.get("args"),
                     "notes": s.get("notes"),
                 },
+                # Adapter sees the social-engineering prompt; gateway gets
+                # the structured tool call so its agency module can apply
+                # authz / param-validation / role checks (otherwise it
+                # short-circuits with "No tool call" → risk_score=0.0).
+                gateway_tool_call={"tool": s.get("tool", ""), "args": s.get("args") or {}},
+                gateway_user_id=s.get("user_id"),
+                gateway_role=s.get("role"),
             )
         )
         if limit is not None and len(cases) >= limit:
