@@ -9,13 +9,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Names of env vars whose values must be redacted in the rendered output.
-SECRETS=(HF_TOKEN HUGGING_FACE_HUB_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY)
+# Redact by NAME PATTERN rather than a hard-coded provider list. Any
+# env-var whose name ends in (or contains) KEY / TOKEN / SECRET /
+# PASSWORD / PASSWD gets its value replaced — so user-named secrets
+# like `MY_GEMINI_KEY` or `INTERNAL_BEARER_TOKEN` are covered without
+# editing this script.
+#
+# The regex matches both YAML map form (`MY_KEY: value`) and list form
+# (`- MY_KEY=value`). Case-insensitive (sed -E + ignore-case via [Kk]
+# etc. is awkward; we rely on the fact that env-var names are
+# conventionally uppercase — anyone using lowercase secret names is
+# already off the well-trodden path).
+PATTERN='([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD))'
 
-SED_ARGS=()
-for name in "${SECRETS[@]}"; do
-    # Matches both YAML map form (`HF_TOKEN: value`) and list form (`- HF_TOKEN=value`).
-    SED_ARGS+=(-e "s|\(${name}[:=] *\).*|\1***REDACTED***|")
-done
-
-docker compose "$@" config | sed "${SED_ARGS[@]}"
+docker compose "$@" config \
+  | sed -E "s|(- ?${PATTERN}=).*|\1***REDACTED***|; s|(${PATTERN}: *)[^[:space:]].*|\1***REDACTED***|"

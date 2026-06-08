@@ -44,6 +44,19 @@ RISK_WEIGHTS = {
     "sequential_probing": 1.00,
     "invalid_resource": 0.60,
     "role_violation": 0.70,
+    # Sprint 8 fix-A: a *single* "resource not found" lookup is NOT itself
+    # a security event — it's the same signal a typo or stale reference
+    # produces. We mark it low-risk so the fused decision stays in the
+    # allow band; anti-enum (1.00) is the actual escalator when the same
+    # user 404s repeatedly. Wire-level response still leaks nothing (the
+    # ``uniform_error()`` string is sent), so the scoring downgrade is
+    # purely internal.
+    "resource_not_found": 0.25,
+    # Bookkeeping aliases so risk_hint→weight lookup is total without
+    # falling back to "unauthorized_access".
+    "unregistered_type": 0.60,
+    "unknown_owner": 0.60,
+    "owner_mismatch": 0.90,
     "clean": 0.00,
 }
 
@@ -136,10 +149,17 @@ class AgencyRiskScorer:
         evidence = []
         scores = []
 
-        # Factor 1: Authorization (IDOR)
+        # Factor 1: Authorization (IDOR + adjacent denies).
+        # Sprint 8 fix-A: pick the weight from ``authz_result.risk_hint``
+        # so a benign "not found" lookup doesn't share the same score as
+        # an actual owner-mismatch IDOR attempt. Legacy AuthzResult
+        # records (empty hint) fall back to "unauthorized_access" so
+        # nothing pre-fix breaks.
         if authz_result and not authz_result.is_allowed:
-            risk_factors.append("unauthorized_access")
-            scores.append(RISK_WEIGHTS["unauthorized_access"])
+            hint = (authz_result.risk_hint or "unauthorized_access").strip()
+            factor = hint if hint in RISK_WEIGHTS else "unauthorized_access"
+            risk_factors.append(factor)
+            scores.append(RISK_WEIGHTS[factor])
             evidence.extend(authz_result.evidence)
 
         # Factor 2: Enumeration detection

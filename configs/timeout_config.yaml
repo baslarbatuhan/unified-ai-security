@@ -38,13 +38,23 @@ profiles:
     # pathologies (model hang, missing weights, etc.).
     modules:
       prompt_guard:  2000
-      rag_guard:    20000   # chunked analysis with qwen2.5:7b CPU-bound
+      # Sprint 8 finding: under adapter+gateway co-location (Playwright
+      # Chromium burning CPU alongside qwen2.5:7b in the judge), rag_guard
+      # consistently overshot the original 20s budget by ~2s on cases
+      # that hit the LLM-judge path (regex-only cases finished in ~12s).
+      # The fail-CLOSED policy then masked true detection logic — see
+      # rag_poison_adv_poison_005 in run_20260523015641 (TIMEOUT block at
+      # rs=1.0) vs run_20260523015403 (clean run at rs=0.272, allow).
+      # 30000 gives headroom without becoming a hang-tolerant config.
+      rag_guard:    30000   # chunked analysis with qwen2.5:7b CPU-bound
       output_agency: 2000
       output_guard:  3000
       fusion:         200
     # Hard ceiling from request arrival to response. Must be >= sum of
     # parallel module budgets + fusion, with a small safety margin.
-    total_request_ms: 25000
+    # Bumped alongside rag_guard so the ceiling doesn't preempt the
+    # module budget it's meant to wrap.
+    total_request_ms: 36000
     # LLM judge ceiling — kept under rag_guard so a single hang doesn't
     # blow the rag budget. Acts as a sub-budget inside the RAG pipeline.
     llm_judge_ms: 18000

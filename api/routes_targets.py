@@ -145,6 +145,63 @@ def _categorise_error(error_class: str | None, error_message: str | None) -> str
     return "unexpected" if cls else ""
 
 
+# Sprint 3.3: probe metadata exposes which env-var names the adapter
+# would consult for this target, plus where each currently resolves
+# from (env / vault / missing). VALUES never leave the gateway through
+# this surface — only names and source labels. The dashboard uses this
+# to render targeted "🔐 paste this secret" hints instead of a generic
+# 401 message.
+
+def _collect_auth_sources(target: TargetConfig) -> Dict[str, str]:
+    """Return a ``{<role>: <source>}`` map for every secret reference in
+    ``target.auth``. ``<role>`` is a human-readable label like
+    ``"auth.token_env: MY_KEY"``; ``<source>`` is one of
+    ``"env" / "vault" / "missing"`` as reported by ``secret_resolver``.
+
+    Iterating here, rather than in the adapter, keeps the probe self-
+    contained: a single round-trip to ``/targets/test`` gives the
+    dashboard everything it needs to diagnose a 401 without a second
+    call to ``/secrets``.
+    """
+    from external_eval.secret_resolver import source_of, iter_var_names
+
+    refs: Dict[str, str] = {}
+    auth = target.auth
+    atype = getattr(auth, "type", None)
+
+    if atype == "bearer" and getattr(auth, "token_env", None):
+        refs[f"auth.token_env: {auth.token_env}"] = source_of(auth.token_env)
+    elif atype == "query" and getattr(auth, "query_value_env", None):
+        refs[f"auth.query_value_env: {auth.query_value_env}"] = source_of(auth.query_value_env)
+    elif atype == "basic":
+        if getattr(auth, "username_env", None):
+            refs[f"auth.username_env: {auth.username_env}"] = source_of(auth.username_env)
+        if getattr(auth, "password_env", None):
+            refs[f"auth.password_env: {auth.password_env}"] = source_of(auth.password_env)
+    elif atype == "header":
+        # Scan header VALUES for ${VAR} placeholders. The names live
+        # in the values, not the keys.
+        for _, hv in (getattr(auth, "headers", None) or {}).items():
+            for name in iter_var_names(str(hv)):
+                refs[f"auth.headers ${{{name}}}"] = source_of(name)
+    elif atype == "cookie":
+        # Sprint 4: cookie values may carry ${VAR} so the actual
+        # session token stays in the vault. We label each ref with
+        # the cookie name for traceability.
+        for spec in (getattr(auth, "cookies", None) or []):
+            cookie_name = getattr(spec, "name", "?")
+            for name in iter_var_names(str(getattr(spec, "value", ""))):
+                refs[f"auth.cookies[{cookie_name}] ${{{name}}}"] = source_of(name)
+
+    # extra_headers can carry ${VAR} too (Sprint 1 made interpolation
+    # symmetric). Same scan, different label prefix.
+    for _, hv in (getattr(auth, "extra_headers", None) or {}).items():
+        for name in iter_var_names(str(hv)):
+            refs[f"auth.extra_headers ${{{name}}}"] = source_of(name)
+
+    return refs
+
+
 @router.post("/test")
 def test_target_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send a single probe prompt to a candidate target without writing it.
@@ -221,6 +278,11 @@ def test_target_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass  # close() best-effort — never mask the original error
 
+    # Sprint 3.3: regardless of ok/fail, include the auth-source map so
+    # the dashboard can render targeted hints on auth-related failures
+    # (and confirm the right secret was used on success).
+    auth_sources = _collect_auth_sources(target)
+
     if response.ok:
         sample = response.text or ""
         if len(sample) > 200:
@@ -234,6 +296,7 @@ def test_target_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
             "response_sample": sample,
             "response_chars": len(response.text or ""),
             "metadata": response.metadata,
+            "auth_sources": auth_sources,
         }
     else:
         return {
@@ -247,4 +310,5 @@ def test_target_connection(payload: Dict[str, Any]) -> Dict[str, Any]:
             "latency_ms": response.latency_ms,
             "error_message": response.error_message or "unknown error",
             "metadata": response.metadata,
+            "auth_sources": auth_sources,
         }

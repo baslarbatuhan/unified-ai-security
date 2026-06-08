@@ -19,6 +19,12 @@ RUN if [ "$TORCH_DEVICE" = "cuda" ]; then \
     fi && \
     pip install --no-cache-dir -r requirements.txt
 
+# Sprint 8: install the Chromium binary + its OS dependencies for the
+# Playwright-backed WebAdapter (`type=web` targets). `--with-deps` pulls
+# the apt packages Chromium needs (fonts, libnss, etc.). This adds
+# ~400-500MB to the image; it is the only browser we ship (chromium).
+RUN playwright install --with-deps chromium
+
 # Copy project
 COPY . .
 

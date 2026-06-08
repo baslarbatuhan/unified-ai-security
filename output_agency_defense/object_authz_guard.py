@@ -46,7 +46,22 @@ AuthzDecision = Literal["allow", "deny"]
 
 @dataclass
 class AuthzResult:
-    """Result of an authorization check."""
+    """Result of an authorization check.
+
+    Sprint 8 fix-A: ``risk_hint`` differentiates *why* a deny was issued
+    so the risk_scoring layer can pick the right weight. All deny paths
+    still return ``decision="deny"`` with a uniform ``reason`` (the
+    ``uniform_error()`` string) so the wire response leaks nothing —
+    the hint is internal to the gateway's scoring pipeline.
+
+    Hint values:
+        ""                      → legacy / unspecified (treated as unauthorized_access)
+        "owner_mismatch"        → real IDOR attempt, high risk
+        "resource_not_found"    → 404 lookup; benign on first occurrence,
+                                  escalated by anti-enum after threshold
+        "unregistered_type"     → resource family unknown to the registry
+        "unknown_owner"         → resource exists but has no owner record
+    """
     decision: AuthzDecision
     resource_type: str
     resource_id: str
@@ -54,6 +69,7 @@ class AuthzResult:
     owner: Optional[str] = None
     reason: str = ""
     evidence: List[str] = field(default_factory=list)
+    risk_hint: str = ""
 
     @property
     def is_allowed(self) -> bool:
@@ -109,13 +125,18 @@ class ObjectAuthzGuard:
                 user=session.user,
                 reason=uniform_error(),
                 evidence=evidence,
+                risk_hint="unregistered_type",
             )
 
         # Step 2: Find the resource
         resource = self.registry.find(resource_type, resource_id)
         if resource is None:
-            # Resource not found — return SAME error as unauthorized
-            # This prevents resource enumeration attacks
+            # Resource not found — wire response is the SAME uniform_error()
+            # as unauthorized (no existence leak on the response).  Sprint 8
+            # fix-A: scoring layer downgrades risk for this hint so an
+            # individual 404 probe isn't an automatic block — anti-enum
+            # threshold then becomes the effective gate when a burst of
+            # 404s arrives.
             evidence.append(f"Resource {resource_type}/{resource_id} not found")
             return AuthzResult(
                 decision="deny",
@@ -124,6 +145,7 @@ class ObjectAuthzGuard:
                 user=session.user,
                 reason=uniform_error(),
                 evidence=evidence,
+                risk_hint="resource_not_found",
             )
 
         # Step 3: Get owner
@@ -137,6 +159,7 @@ class ObjectAuthzGuard:
                 user=session.user,
                 reason=uniform_error(),
                 evidence=evidence,
+                risk_hint="unknown_owner",
             )
 
         # Step 4: Compare owner with session user
@@ -152,6 +175,7 @@ class ObjectAuthzGuard:
                 owner=owner,
                 reason=uniform_error(),
                 evidence=evidence,
+                risk_hint="owner_mismatch",
             )
 
         # Access granted

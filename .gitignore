@@ -28,6 +28,12 @@ runs/
 logs/
 reports/
 
+# ── Local thesis docs / temp (do not push) ─────────────
+tez_v2.md
+ieee_final.md
+scripts/generate_thesis_figures.py
+external_eval/targets.yaml.tmp
+
 # ── Testing / IDE / OS ─────────────────────────────────
 .pytest_cache/
 .mypy_cache/

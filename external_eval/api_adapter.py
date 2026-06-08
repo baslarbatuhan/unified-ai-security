@@ -41,6 +41,10 @@ from external_eval.base_adapter import (
     AdapterTransportError,
     ChatbotAdapter,
 )
+from external_eval.secret_resolver import (
+    resolve as _resolve_secret,
+    interpolate as _interpolate_secrets,
+)
 
 
 DEFAULT_REQUEST_TEMPLATE: Dict[str, Any] = {
@@ -94,20 +98,28 @@ class APIAdapter(ChatbotAdapter):
 
         if atype == "bearer":
             # Prefer env-var lookup; fall back to inline `token` for tests
-            # and the legacy YAML shape.
+            # and the legacy YAML shape. ``_resolve_secret`` also probes
+            # the local vault (runs/.secrets.yaml) when the env-var is
+            # unset, which is how dashboard-pasted keys reach the wire.
             token = (auth.token or "")
             if not token and auth.token_env:
-                token = os.environ.get(auth.token_env, "")
+                token = _resolve_secret(auth.token_env)
             if token:
                 headers["Authorization"] = f"Bearer {token}"
 
         elif atype == "header":
+            # Sprint 1: each header value passes through ``${VAR}``
+            # interpolation so users can write
+            #   {"x-api-key": "${MY_KEY}"}
+            # in the form / yaml and keep the actual secret in the
+            # local vault (or a real env-var).  Static values
+            # (no ``${``) round-trip unchanged.
             for k, v in (auth.headers or {}).items():
-                headers[str(k)] = str(v)
+                headers[str(k)] = _interpolate_secrets(str(v))
 
         elif atype == "basic":
-            user = auth.username or (os.environ.get(auth.username_env, "") if auth.username_env else "")
-            pw = auth.password or (os.environ.get(auth.password_env, "") if auth.password_env else "")
+            user = auth.username or (_resolve_secret(auth.username_env) if auth.username_env else "")
+            pw = auth.password or (_resolve_secret(auth.password_env) if auth.password_env else "")
             if user or pw:
                 import base64
                 token = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
@@ -118,8 +130,13 @@ class APIAdapter(ChatbotAdapter):
 
         # Always merge extra_headers (works for any auth type, including
         # `none`). Caller-set headers take precedence over extras, so we
-        # write extras first.
-        merged = dict(getattr(auth, "extra_headers", {}) or {})
+        # write extras first.  ``${VAR}`` interpolation is applied here
+        # too — extra_headers is a natural home for vendor identifiers
+        # but some users park a custom token there as well.
+        merged = {
+            str(k): _interpolate_secrets(str(v))
+            for k, v in (getattr(auth, "extra_headers", {}) or {}).items()
+        }
         merged.update(headers)
         return {str(k): str(v) for k, v in merged.items()}
 
@@ -134,7 +151,7 @@ class APIAdapter(ChatbotAdapter):
             return params
         value = auth.query_value or ""
         if not value and auth.query_value_env:
-            value = os.environ.get(auth.query_value_env, "")
+            value = _resolve_secret(auth.query_value_env)
         if not value:
             # Missing secret at runtime — surface as empty param so the
             # downstream 401/403 is the visible failure mode instead of a

@@ -6,7 +6,9 @@ targets:
   enabled: true
   timeout_seconds: 5.0
   has_tools: false
-  auth: {}
+  auth:
+    extra_headers: {}
+    type: none
   http_method: POST
   metadata:
     description: Echoes the prompt back with a safe prefix. For dev + CI.
@@ -18,6 +20,7 @@ targets:
   timeout_seconds: 30.0
   has_tools: false
   auth:
+    extra_headers: {}
     type: bearer
     token_env: CHATBOT_BEARER_TOKEN
   http_method: POST
@@ -38,7 +41,9 @@ targets:
   endpoint: https://example.com/chat
   timeout_seconds: 45.0
   has_tools: false
-  auth: {}
+  auth:
+    extra_headers: {}
+    type: none
   http_method: POST
   selectors:
     input: textarea[data-testid=chat-input]
@@ -59,20 +64,51 @@ targets:
   endpoint: http://10.147.10.22:9993/chat/n4bchatbot
   timeout_seconds: 30.0
   has_tools: false
-  auth: {}
+  auth:
+    extra_headers: {}
+    type: none
   http_method: POST
   request_template:
     message: '{prompt}'
   response_path: result.answer
   metadata: {}
-- id: gemini_flash
-  name: Gemini Flash (Google)
+- id: local_tools
+  name: Local Tools (weather / stock / calc)
+  type: tools_local
+  enabled: true
+  timeout_seconds: 15.0
+  has_tools: true
+  auth:
+    extra_headers: {}
+    type: none
+  http_method: POST
+  metadata:
+    description: 'Gateway-side tool execution. Runs ATK-031..050 scenarios end-to-end:
+
+      gateway pre-screens tool_call, then if allowed the runner actually
+
+      invokes the registered tool (open-meteo for weather_forecast,
+
+      Yahoo Finance public chart for stock_quote, simpleeval for
+
+      calc_evaluate). Demonstrates the full pre-screen + execute +
+
+      response lifecycle.
+
+      '
+    tools_registered:
+    - weather_forecast
+    - stock_quote
+    - calc_evaluate
+- id: gemini_flash_test
+  name: Gemini Flash
   type: api
   enabled: true
   endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent
   timeout_seconds: 30.0
   has_tools: false
   auth:
+    extra_headers: {}
     type: query
     query_key: key
     query_value_env: GEMINI_API_KEY
@@ -82,32 +118,49 @@ targets:
     - parts:
       - text: '{prompt}'
   response_path: candidates.0.content.parts.0.text
-  rate_limit:
-    requests_per_minute: 60
-    burst: 5
-  metadata:
-    provider: google
-    notes: |
-      Free-tier Gemini Flash. Auth via ?key=... query parameter,
-      value pulled from GEMINI_API_KEY env var at request time.
-      Hafta 11.2 auth pipeline validates the shape; the secret
-      never enters targets.yaml or any committed file.
-- id: local_tools
-  name: Local Tools (weather / stock / calc)
-  type: tools_local
+  metadata: {}
+- id: open_webui_api
+  name: Open WebUI (api)
+  type: api
   enabled: true
-  timeout_seconds: 15.0
-  has_tools: true
-  auth: {}
-  metadata:
-    description: |
-      Gateway-side tool execution. Runs ATK-031..050 scenarios end-to-end:
-      gateway pre-screens tool_call, then if allowed the runner actually
-      invokes the registered tool (open-meteo for weather_forecast,
-      Yahoo Finance public chart for stock_quote, simpleeval for
-      calc_evaluate). Demonstrates the full pre-screen + execute +
-      response lifecycle.
-    tools_registered:
-      - weather_forecast
-      - stock_quote
-      - calc_evaluate
+  endpoint: http://open-webui:8080/api/chat/completions
+  timeout_seconds: 60.0
+  has_tools: false
+  auth:
+    extra_headers: {}
+    type: bearer
+    token_env: MY_OPENWEBUI_KEY
+  http_method: POST
+  request_template:
+    model: qwen2.5:3b
+    messages:
+    - role: user
+      content: '{prompt}'
+    chat_id: uais-eval-probe
+    stream: false
+  response_path: choices.0.message.content
+  metadata: {}
+- id: open_webui_web
+  name: Open WebUI (web)
+  type: web
+  enabled: true
+  endpoint: http://open-webui:8080
+  timeout_seconds: 60.0
+  has_tools: false
+  auth:
+    extra_headers: {}
+    type: cookie
+    cookies: []
+    storage_state_path: /app/runs/open_webui_state.json
+  http_method: POST
+  selectors:
+    input: '#chat-input'
+    submit: '#send-message-button'
+    response: '#response-content-container >> nth=-1'
+    fallback_input:
+    - div[contenteditable="true"]
+    fallback_response:
+    - '#response-content-container'
+    - p[dir="auto"]
+    response_wait_ms: 8000
+  metadata: {}

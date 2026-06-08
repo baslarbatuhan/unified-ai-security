@@ -73,6 +73,15 @@ class GatewayClient:
             raise GatewayError(f"POST {path} → HTTP {resp.status_code}: {resp.text[:200]}")
         return resp.json() if resp.content else None
 
+    def put_json(self, path: str, payload: Dict[str, Any]) -> Any:
+        try:
+            resp = requests.put(self._url(path), json=payload, timeout=self.timeout_s)
+        except requests.RequestException as exc:
+            raise GatewayError(f"PUT {path} failed: {exc}") from exc
+        if resp.status_code >= 400:
+            raise GatewayError(f"PUT {path} → HTTP {resp.status_code}: {resp.text[:200]}")
+        return resp.json() if resp.content else None
+
     def delete(self, path: str) -> Any:
         try:
             resp = requests.delete(self._url(path), timeout=self.timeout_s)
