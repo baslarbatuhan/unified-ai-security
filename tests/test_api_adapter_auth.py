@@ -116,6 +116,94 @@ class TestAuthHeaders:
 
 
 # ---------------------------------------------------------------------------
+# Sprint 1 — ``${VAR}`` interpolation in header values
+# ---------------------------------------------------------------------------
+class TestHeaderInterpolation:
+    """The header auth variant substitutes ``${NAME}`` tokens via
+    ``secret_resolver.resolve(NAME)``. This is how header-key-based
+    providers (Anthropic ``x-api-key``, Gemini-header ``x-goog-api-key``,
+    custom corporate auth schemes) reach the wire without their secrets
+    landing in ``targets.yaml``."""
+
+    def test_literal_value_unchanged(self) -> None:
+        """No ``${`` token → value passes through verbatim. Static
+        identifiers like X-Tenant survive the interpolation pass."""
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"X-Tenant": "acme-corp"},
+        ))
+        assert adapter._auth_headers()["X-Tenant"] == "acme-corp"
+
+    def test_var_resolved_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("UAIS_TEST_HEADER_KEY", "from-env-secret")
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"x-api-key": "${UAIS_TEST_HEADER_KEY}"},
+        ))
+        assert adapter._auth_headers()["x-api-key"] == "from-env-secret"
+
+    def test_var_resolved_from_vault(self, tmp_path, monkeypatch) -> None:
+        """Vault is the dashboard-managed fallback — used when no
+        env-var of the same name is set."""
+        from external_eval import secrets_store
+        vault = tmp_path / "secrets.yaml"
+        monkeypatch.setenv("UAIS_SECRETS_PATH", str(vault))
+        monkeypatch.delenv("UAIS_TEST_VAULT_KEY", raising=False)
+        secrets_store.set("UAIS_TEST_VAULT_KEY", "from-vault-secret")
+
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"x-api-key": "${UAIS_TEST_VAULT_KEY}"},
+        ))
+        assert adapter._auth_headers()["x-api-key"] == "from-vault-secret"
+
+    def test_missing_var_substitutes_empty(self, monkeypatch) -> None:
+        """An unresolved ``${VAR}`` becomes the empty string. The
+        downstream 401/403 is the visible failure mode — better than a
+        silently dropped header that hides the misconfiguration."""
+        monkeypatch.delenv("UAIS_TEST_MISSING", raising=False)
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"x-api-key": "${UAIS_TEST_MISSING}"},
+        ))
+        # Header still emitted with an empty value, not dropped.
+        assert adapter._auth_headers()["x-api-key"] == ""
+
+    def test_multiple_vars_in_one_value(self, monkeypatch) -> None:
+        """A single header value can carry several placeholders —
+        useful for composite schemes like
+        ``Authorization: Bearer ${PREFIX}-${TOKEN}``."""
+        monkeypatch.setenv("UAIS_TEST_PREFIX", "v2")
+        monkeypatch.setenv("UAIS_TEST_TOKEN", "abc")
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"X-Auth": "scheme=${UAIS_TEST_PREFIX}/${UAIS_TEST_TOKEN}"},
+        ))
+        assert adapter._auth_headers()["X-Auth"] == "scheme=v2/abc"
+
+    def test_extra_headers_interpolated_too(self, monkeypatch) -> None:
+        """``extra_headers`` shares the same interpolation pass —
+        consistency matters; users may park a header secret there
+        regardless of which auth variant the target uses."""
+        monkeypatch.setenv("UAIS_TEST_EXTRA", "extra-secret")
+        adapter = APIAdapter(_api_target(
+            type="none",
+            extra_headers={"X-Org-Token": "${UAIS_TEST_EXTRA}"},
+        ))
+        assert adapter._auth_headers()["X-Org-Token"] == "extra-secret"
+
+    def test_dollar_sign_without_braces_is_literal(self) -> None:
+        """``$FOO`` (no braces) is not a placeholder — pattern is
+        strictly ``${...}``. This keeps headers carrying literal
+        dollar signs (rare but legal) from being mangled."""
+        adapter = APIAdapter(_api_target(
+            type="header",
+            headers={"X-Price": "$5.99 charge"},
+        ))
+        assert adapter._auth_headers()["X-Price"] == "$5.99 charge"
+
+
+# ---------------------------------------------------------------------------
 # _apply_query_auth — URL param injection
 # ---------------------------------------------------------------------------
 class TestApplyQueryAuth:

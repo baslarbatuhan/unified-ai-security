@@ -33,6 +33,14 @@ httpx>=0.24
 # we ship simpleeval explicitly so demo runs use the maintained library.
 simpleeval>=0.9
 
+# Web target adapter (Sprint 8):
+# Playwright drives a headless Chromium for `type=web` targets
+# (external_eval/web_adapter.py). The browser binary itself is installed
+# in the Dockerfile via `playwright install --with-deps chromium`; this
+# line only pulls the Python bindings. WebAdapter import-guards on this
+# so the package still loads on hosts without Playwright.
+playwright>=1.40
+
 # Evaluation report generation (Hafta 15):
 # matplotlib used by scripts/generate_thesis_report.py to render the
 # charts that ship as PNG attachments next to the markdown / PDF report.

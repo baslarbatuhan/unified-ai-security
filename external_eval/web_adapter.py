@@ -29,6 +29,7 @@ from external_eval.base_adapter import (
     AdapterTransportError,
     ChatbotAdapter,
 )
+from external_eval.secret_resolver import interpolate as _interpolate_secrets
 
 
 class WebAdapter(ChatbotAdapter):
@@ -67,6 +68,45 @@ class WebAdapter(ChatbotAdapter):
         self._started = False
 
     # ------------------------------------------------------------------
+    # Sprint 4 — pre-authenticated session helpers
+    # ------------------------------------------------------------------
+    def _resolved_cookies(self) -> List[Dict[str, Any]]:
+        """Return Playwright-shaped cookie dicts with ``${VAR}`` values
+        substituted via ``secret_resolver``.  Empty list if the target
+        has no cookie auth or storage_state-only cookie auth."""
+        out: List[Dict[str, Any]] = []
+        auth = self.target.auth
+        if getattr(auth, "type", None) != "cookie":
+            return out
+        for spec in (getattr(auth, "cookies", None) or []):
+            payload: Dict[str, Any] = {
+                "name": spec.name,
+                "value": _interpolate_secrets(spec.value),
+                "path": spec.path,
+                "secure": spec.secure,
+                "httpOnly": spec.http_only,
+                "sameSite": spec.same_site,
+            }
+            # Playwright requires `url` XOR `domain`. Prefer explicit
+            # config; else derive from the target endpoint so the user
+            # only needs to fill `name` + `value` for the common case.
+            if spec.url:
+                payload["url"] = spec.url
+            elif spec.domain:
+                payload["domain"] = spec.domain
+            else:
+                payload["url"] = self.target.endpoint
+            out.append(payload)
+        return out
+
+    def _storage_state_path(self) -> Optional[str]:
+        """Return the configured storage_state path or None."""
+        auth = self.target.auth
+        if getattr(auth, "type", None) != "cookie":
+            return None
+        return getattr(auth, "storage_state_path", None) or None
+
+    # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
     def _ensure_started(self) -> None:
@@ -76,7 +116,35 @@ class WebAdapter(ChatbotAdapter):
 
         self._pw_ctx = sync_playwright().start()
         self._browser = self._pw_ctx.chromium.launch(headless=True)
-        context = self._browser.new_context()
+
+        # Sprint 4: pre-authenticated session.  storage_state takes
+        # precedence — if both are configured, the file's cookies +
+        # localStorage land first and the explicit cookie list is
+        # appended on top (useful for overriding one specific cookie
+        # like CSRF without re-exporting the whole storage_state).
+        context_kwargs: Dict[str, Any] = {}
+        ss_path = self._storage_state_path()
+        if ss_path:
+            context_kwargs["storage_state"] = ss_path
+        try:
+            context = self._browser.new_context(**context_kwargs)
+        except Exception as exc:
+            self._teardown()
+            raise AdapterConfigError(
+                f"failed to create browser context "
+                f"(storage_state={ss_path!r}): {exc}"
+            ) from exc
+
+        cookies = self._resolved_cookies()
+        if cookies:
+            try:
+                context.add_cookies(cookies)
+            except Exception as exc:
+                self._teardown()
+                raise AdapterConfigError(
+                    f"failed to add cookies to browser context: {exc}"
+                ) from exc
+
         self._page = context.new_page()
         self._page.set_default_timeout(int(self.target.timeout_seconds * 1000))
         try:
@@ -111,13 +179,33 @@ class WebAdapter(ChatbotAdapter):
     def _selector_chain(self, primary: str, fallbacks: List[str]) -> List[str]:
         return [primary, *fallbacks]
 
-    def _find_first(self, selectors: List[str]):
-        """Try selectors in order; return the first Locator that resolves."""
+    def _find_first(self, selectors: List[str], wait_ms: int = 0):
+        """Try selectors in order; return the first Locator that resolves.
+
+        ``wait_ms`` controls SPA tolerance:
+
+          * ``0`` (default) — a synchronous ``count()`` snapshot. Right
+            for the response-polling loop, which re-calls this every
+            200ms and does its own waiting.
+          * ``> 0`` — each selector is given up to ``wait_ms`` to become
+            *visible* (Playwright auto-wait). Needed when locating the
+            input element on JS-rendered SPAs (Open WebUI, etc.) where
+            the DOM node simply does not exist yet at ``domcontentloaded``.
+            The wait is per-selector, so a 2-entry chain can block for up
+            to ``2 * wait_ms`` before raising — callers budget for that.
+        """
         assert self._page is not None
         last_exc: Optional[Exception] = None
         for sel in selectors:
             try:
                 loc = self._page.locator(sel)
+                if wait_ms > 0:
+                    try:
+                        loc.first.wait_for(state="visible", timeout=wait_ms)
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+                    return loc.first, sel
                 if loc.count() > 0:
                     return loc.first, sel
             except Exception as exc:
@@ -139,9 +227,15 @@ class WebAdapter(ChatbotAdapter):
         selectors = self.target.selectors
         assert selectors is not None
 
-        # Locate input
+        # Locate input. SPAs (Open WebUI / Svelte, React chatbots) build
+        # the input node in JS *after* `domcontentloaded`, so a bare
+        # `count()` snapshot races the render and fails with
+        # "no selector matched". Give each input selector a real wait
+        # budget — a quarter of the target timeout, min 3s — so the
+        # first send absorbs the one-time SPA boot cost.
         in_chain = self._selector_chain(selectors.input, selectors.fallback_input)
-        input_el, input_sel = self._find_first(in_chain)
+        input_wait_ms = max(3000, int(self.target.timeout_seconds * 1000 / 4))
+        input_el, input_sel = self._find_first(in_chain, wait_ms=input_wait_ms)
         try:
             input_el.fill(prompt)
         except Exception as exc:

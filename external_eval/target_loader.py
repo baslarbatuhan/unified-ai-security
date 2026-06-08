@@ -16,6 +16,7 @@ deployments, front the dashboard API with a single writer process.
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from threading import RLock
@@ -48,7 +49,11 @@ def load_targets(path: Optional[Path] = None) -> TargetsFile:
 
 
 def save_targets(tf: TargetsFile, path: Optional[Path] = None) -> Path:
-    """Write the targets file atomically (write to `.tmp` then rename)."""
+    """Write the targets file atomically (write to `.tmp` then rename).
+
+    Docker bind-mounts the targets file directly; ``os.replace`` onto that
+    path raises ``EBUSY``. Fall back to an in-place write in that case.
+    """
     path = path or DEFAULT_TARGETS_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -56,7 +61,14 @@ def save_targets(tf: TargetsFile, path: Optional[Path] = None) -> Path:
     with _FILE_LOCK:
         with tmp.open("w", encoding="utf-8") as f:
             yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EBUSY):
+                raise
+            with path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+            tmp.unlink(missing_ok=True)
     return path
 
 

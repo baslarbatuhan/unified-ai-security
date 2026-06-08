@@ -129,8 +129,91 @@ class AuthBasic(_AuthBase):
         return self
 
 
+# ---------------------------------------------------------------------------
+# Sprint 4 — Cookie / storage_state auth (web targets)
+# ---------------------------------------------------------------------------
+# Playwright's `Browser.new_context(storage_state=...)` and
+# `BrowserContext.add_cookies([...])` are the two supported paths into a
+# pre-authenticated session.  We model both on the same variant so the
+# dashboard form can pick whichever matches the user's situation:
+#
+#   * Static cookies — copied from the browser's devtools.  Lightweight,
+#     manual refresh when the session expires.  Cookie *values* may
+#     reference `${VAR}` so the actual session token lives in the
+#     local vault, not in targets.yaml.
+#   * storage_state path — a JSON file exported via Playwright's
+#     `context.storage_state(path=...)`.  Captures cookies + localStorage
+#     + sessionStorage in one shot; useful for sites that drop a SPA
+#     bootstrap key into localStorage.
+
+class CookieSpec(BaseModel):
+    """A single cookie to inject before the first page load.
+
+    Field semantics mirror Playwright's `BrowserContext.add_cookies()`
+    payload shape exactly — we forward verbatim after resolving
+    ``${VAR}`` placeholders in ``value``.
+    """
+
+    name: str = Field(..., min_length=1)
+    # ``value`` accepts ``${VAR_NAME}`` placeholders, resolved at request
+    # time via secret_resolver (env-var → vault → empty).  Literal
+    # values round-trip unchanged.
+    value: str = Field(..., description="Cookie value. Supports ${VAR} interpolation.")
+    domain: Optional[str] = Field(
+        default=None,
+        description=(
+            "Cookie domain (e.g. '.example.com').  Either `domain` "
+            "or `url` is required by Playwright; if both are omitted "
+            "the cookie is bound to the target's endpoint host."
+        ),
+    )
+    url: Optional[str] = Field(
+        default=None,
+        description="Alternative to `domain`; Playwright derives both fields from this URL.",
+    )
+    path: str = Field(default="/")
+    secure: bool = Field(default=True)
+    http_only: bool = Field(default=False, alias="httpOnly")
+    same_site: Literal["Strict", "Lax", "None"] = Field(default="Lax", alias="sameSite")
+
+    # Allow both the Pythonic and the Playwright-native field names so
+    # users can paste devtools-formatted JSON without renaming keys.
+    model_config = {"populate_by_name": True}
+
+
+class AuthCookie(_AuthBase):
+    """Pre-authenticated web session via static cookies or storage_state.
+
+    Only honoured by the WebAdapter (Playwright). API targets ignore
+    this variant — the form hides it for them.
+    """
+
+    type: Literal["cookie"]
+    cookies: List[CookieSpec] = Field(
+        default_factory=list,
+        description="Static cookie list. Values may use ${VAR} interpolation.",
+    )
+    storage_state_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Path to a Playwright storage_state JSON (relative to the "
+            "gateway container or absolute).  Loaded into the browser "
+            "context on startup, replacing the default fresh session."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _need_one_source(self) -> "AuthCookie":
+        if not self.cookies and not self.storage_state_path:
+            raise ValueError(
+                "cookie auth requires at least one of `cookies` or "
+                "`storage_state_path`"
+            )
+        return self
+
+
 AuthConfig = Annotated[
-    Union[AuthNone, AuthBearer, AuthHeader, AuthQuery, AuthBasic],
+    Union[AuthNone, AuthBearer, AuthHeader, AuthQuery, AuthBasic, AuthCookie],
     Field(discriminator="type"),
 ]
 
@@ -299,4 +382,6 @@ __all__ = [
     "AuthHeader",
     "AuthQuery",
     "AuthBasic",
+    "AuthCookie",
+    "CookieSpec",
 ]

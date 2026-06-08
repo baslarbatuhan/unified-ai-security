@@ -18,7 +18,21 @@ services:
       - ../rag_guard:/app/rag_guard:ro
       - ../output_agency_defense:/app/output_agency_defense:ro
       - ../output_guard:/app/output_guard:ro
-      - ../external_eval:/app/external_eval:ro
+      # Per-file binds only — do NOT mount ../external_eval as a directory:
+      # base compose already bind-mounts targets.yaml; a dir mount + file mount
+      # breaks atomic rename (EBUSY) on CRUD.
+      - ../external_eval/target_loader.py:/app/external_eval/target_loader.py:ro
+      - ../external_eval/api_adapter.py:/app/external_eval/api_adapter.py:ro
+      - ../external_eval/secrets_store.py:/app/external_eval/secrets_store.py:ro
+      - ../external_eval/secret_resolver.py:/app/external_eval/secret_resolver.py:ro
+      - ../external_eval/adapter_factory.py:/app/external_eval/adapter_factory.py:ro
+      - ../external_eval/web_adapter.py:/app/external_eval/web_adapter.py:ro
+      - ../external_eval/mock_adapter.py:/app/external_eval/mock_adapter.py:ro
+      - ../external_eval/base_adapter.py:/app/external_eval/base_adapter.py:ro
+      - ../external_eval/tool_adapter.py:/app/external_eval/tool_adapter.py:ro
+      - ../external_eval/attack_suites.py:/app/external_eval/attack_suites.py:ro
+      - ../external_eval/run_external_eval.py:/app/external_eval/run_external_eval.py:ro
+      - ../external_eval/__init__.py:/app/external_eval/__init__.py:ro
       - ../evaluation:/app/evaluation:ro
       - ../schemas:/app/schemas:ro
       - ../monitoring:/app/monitoring:ro

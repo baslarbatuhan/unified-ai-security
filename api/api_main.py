@@ -185,10 +185,14 @@ from api.routes_reports import router as reports_router  # noqa: E402
 from api.routes_targets import router as targets_router  # noqa: E402
 # Hafta 12.1: per-decision audit trace lookups (Results page drill-down).
 from api.routes_decisions import router as decisions_router  # noqa: E402
+# Local secrets vault — pasted-from-dashboard credentials reach the
+# api_adapter via secret_resolver, but the CRUD surface lives here.
+from api.routes_secrets import router as secrets_router  # noqa: E402
 app.include_router(runs_router)
 app.include_router(reports_router)
 app.include_router(targets_router)
 app.include_router(decisions_router)
+app.include_router(secrets_router)
 
 # Dashboard UI is a separate Streamlit process (`streamlit run dashboard/app.py`).
 # It consumes this gateway's read-only routes (/dashboard/*, /runs, /reports,

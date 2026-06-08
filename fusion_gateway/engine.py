@@ -506,6 +506,48 @@ def _register_gateway_demo_schemas(validator) -> None:
     })
 
 
+# ---------------------------------------------------------------------------
+# Sprint 9 Fix C — agency guard singletons
+# ---------------------------------------------------------------------------
+# Why singletons: AntiEnumGuard tracks a per-user attempt history inside
+# its SequentialProbeDetector. If we re-instantiate it on every
+# /analyze call (the legacy behaviour), the 3rd sequential probe never
+# sees the previous two — the threshold detector becomes dead code.
+# Holding the guards at module scope keeps their state alive across
+# requests. The detector uses a sliding 60s window so the in-memory
+# record never grows unbounded.
+#
+# `ObjectAuthzGuard` and `ParameterValidator` are stateless; we still
+# memoise them here to avoid re-running ``_register_gateway_demo_schemas``
+# on every request (negligible cost, but keeps the function pure).
+#
+# Not thread-safe — the dashboard's gateway is single-worker. If we
+# ever scale out (gunicorn N>1), replace this with a Redis-backed
+# detector or pin requests to one worker per user_id.
+_AGENCY_SINGLETONS: Optional[Dict[str, Any]] = None
+
+
+def _get_agency_singletons() -> Dict[str, Any]:
+    """Lazy-init the agency guard set on first call; reuse forever."""
+    global _AGENCY_SINGLETONS
+    if _AGENCY_SINGLETONS is None:
+        from output_agency_defense.resource_registry import create_demo_registry
+        from output_agency_defense.object_authz_guard import ObjectAuthzGuard
+        from output_agency_defense.anti_enum_guard import AntiEnumGuard
+        from output_agency_defense.parameter_validation import ParameterValidator
+
+        registry = create_demo_registry()
+        param_validator = ParameterValidator()
+        _register_gateway_demo_schemas(param_validator)
+        _AGENCY_SINGLETONS = {
+            "registry": registry,
+            "authz": ObjectAuthzGuard(registry),
+            "enum_guard": AntiEnumGuard(),
+            "param_validator": param_validator,
+        }
+    return _AGENCY_SINGLETONS
+
+
 def _evaluate_agency_guard(
     tool_call: Optional[Dict],
     user_id: str,
@@ -530,17 +572,21 @@ def _evaluate_agency_guard(
             latency_ms=0,
         )
     try:
-        from output_agency_defense.resource_registry import create_demo_registry
-        from output_agency_defense.object_authz_guard import ObjectAuthzGuard, Session
-        from output_agency_defense.anti_enum_guard import AntiEnumGuard
-        from output_agency_defense.parameter_validation import ParameterValidator
+        # Sprint 9 Fix C: hoist the agency guards out of the per-request
+        # path into a process-wide singleton. AntiEnumGuard needs state
+        # to *persist* across /analyze calls — otherwise the 3rd
+        # sequential probe never sees probes 1 and 2 (each fresh instance
+        # starts from zero). The 60s sliding window inside
+        # SequentialProbeDetector auto-prunes old records, so the
+        # accumulating state never grows unbounded.
+        from output_agency_defense.object_authz_guard import Session
         from output_agency_defense.prompt_scanner import scan_user_prompt
 
-        registry = create_demo_registry()
-        authz = ObjectAuthzGuard(registry)
-        enum_guard = AntiEnumGuard()
-        param_validator = ParameterValidator()
-        _register_gateway_demo_schemas(param_validator)
+        _singletons = _get_agency_singletons()
+        registry = _singletons["registry"]
+        authz = _singletons["authz"]
+        enum_guard = _singletons["enum_guard"]
+        param_validator = _singletons["param_validator"]
 
         tool_name = tool_call.get("tool", "")
         args = tool_call.get("args", {})
@@ -604,7 +650,26 @@ def _evaluate_agency_guard(
             rtype = "order" if "ORD" in resource_id else "ticket"
             authz_result = authz.authorize(rtype, resource_id, session)
             if not authz_result.is_allowed:
-                risk_score = max(risk_score, 0.90)
+                # Sprint 9 Fix A: pick the score from authz_result.risk_hint
+                # so a benign "not found" lookup doesn't share the IDOR
+                # weight (0.90). Anti-enum's 1.00 then becomes the actual
+                # escalator when a burst of 404s arrives from the same
+                # user — without this, the 0.90 floor from a single 404
+                # already pre-empts the threshold detector.
+                _hint = (getattr(authz_result, "risk_hint", "") or "").strip()
+                _AUTHZ_HINT_SCORE = {
+                    # 0.25 keeps the module's own band classification in
+                    # *allow* (score < allow_t 0.30 is strict in
+                    # _threshold_decision); 0.30 lands on the sanitize
+                    # boundary and triggers an unwanted band-elevation
+                    # override at the fusion layer.
+                    "resource_not_found": 0.25,
+                    "unregistered_type":  0.60,
+                    "unknown_owner":      0.60,
+                    "owner_mismatch":     0.90,
+                }
+                authz_score = _AUTHZ_HINT_SCORE.get(_hint, 0.90)
+                risk_score = max(risk_score, authz_score)
                 evidence.extend(authz_result.evidence)
 
         if not evidence:

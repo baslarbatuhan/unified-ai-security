@@ -18,10 +18,16 @@
 #
 # Env file
 # --------
-# `infra/.env` (see infra/.env.example). Keys consumed here:
+# `infra/.env` (see infra/.env.example). The gateway pulls the whole file
+# via `env_file:` below, so any KEY=value the user puts there becomes an
+# env-var inside the container — no need to enumerate provider-specific
+# names in this compose. Targets reference whichever env-var name the
+# user chose (`auth.token_env: MY_KEY` / `query_value_env: MY_KEY`).
+# Secrets can also be added at runtime via the dashboard's Targets page
+# (local vault, no container restart needed).
+#
+# Compose itself consumes:
 #   HF_TOKEN              — Hugging Face Hub auth (BGE-M3 download speed)
-#   OPENAI_API_KEY        — passed to gateway for OpenAI-style targets
-#   ANTHROPIC_API_KEY     — passed to gateway for Anthropic-style targets
 #   GATEWAY_URL           — only honoured by the dashboard; defaults to in-network
 services:
   gateway:
@@ -46,12 +52,14 @@ services:
       # Same secret; both names are read by huggingface_hub / transformers
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-      # Target-side credential passthrough — used by APIAdapter when a user
-      # configures `auth.token_env=OPENAI_API_KEY` (etc.) on a target.
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - CHATBOT_BEARER_TOKEN=${CHATBOT_BEARER_TOKEN:-}
+    # User-defined secrets: every KEY=value line in infra/.env becomes an
+    # env-var in the gateway container. Targets pick them up by name via
+    # `auth.token_env: <KEY>` / `query_value_env: <KEY>` — the user owns
+    # the naming, no provider is hard-coded here. Missing file is OK
+    # (`required: false`) so first-boot before users create .env works.
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - hf_cache:/app/.cache/huggingface
       - gateway_logs:/app/logs
@@ -154,6 +162,39 @@ services:
       - ollama_data:/root/.ollama
     restart: unless-stopped
 
+  # Open WebUI — a self-hosted ChatGPT-style chat interface, used here as
+  # a concrete *web target* (Sprint 8). It talks to the existing `ollama`
+  # service over the internal network, so no paid API key is needed.
+  #
+  # The WebAdapter (Playwright) probes this UI at http://open-webui:8080
+  # from inside the gateway container; the host sees it on :3000.
+  #
+  # W1 ships with WEBUI_AUTH=False so the first selector-discovery +
+  # probe pass has no login/cookie friction. Flip it to True later
+  # (Sprint 8 W4) to exercise the cookie / storage_state auth path.
+  #
+  # Model note: this service does NOT pull a model. Open WebUI surfaces
+  # whatever the shared `ollama_data` volume already holds (the LLM judge
+  # uses qwen2.5:7b, so a model is usually present). If the model list is
+  # empty, pull one once: `docker exec uais-ollama ollama pull qwen2.5:3b`.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: uais-open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=True
+      - ENABLE_API_KEYS=True
+      - ENABLE_SIGNUP=False
+      - ENABLE_LOGIN_FORM=True
+    volumes:
+      - open_webui_data:/app/backend/data
+    depends_on:
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
   # Sandbox container for isolated tool execution
   sandbox:
     profiles: ["sandbox"]
@@ -179,3 +220,4 @@ volumes:
   ollama_data:
   hf_cache:
   gateway_logs:
+  open_webui_data:
