@@ -90,6 +90,16 @@ class TestFormatRegistryLabel:
         lbl = format_registry_label(entry)
         assert "2026-05-06 05:00:00" in lbl
 
+    def test_firewall_run_gets_badge(self) -> None:
+        entry = {"run_id": "x", "target_id": "t", "suite": "s",
+                 "n_rows": 1, "mode": "firewall"}
+        assert "🛡️firewall" in format_registry_label(entry)
+
+    def test_passthrough_run_has_no_badge(self) -> None:
+        entry = {"run_id": "x", "target_id": "t", "suite": "s",
+                 "n_rows": 1, "mode": "passthrough"}
+        assert "🛡️" not in format_registry_label(entry)
+
 
 # ---------------------------------------------------------------------------
 # components.risk_level_from_score

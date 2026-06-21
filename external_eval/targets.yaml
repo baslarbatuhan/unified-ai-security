@@ -10,6 +10,10 @@ targets:
     extra_headers: {}
     type: none
   http_method: POST
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata:
     description: Echoes the prompt back with a safe prefix. For dev + CI.
 - id: internal_chatbot_api
@@ -32,6 +36,10 @@ targets:
   rate_limit:
     requests_per_minute: 60
     burst: 10
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata:
     notes: Tool calling disabled by backend for this term.
 - id: example_web_chatbot
@@ -55,6 +63,10 @@ targets:
     fallback_response:
     - .message.assistant:last-child
     response_wait_ms: 4000
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata:
     notes: Update selectors when the UI revs.
 - id: chatbot_n4b
@@ -71,6 +83,10 @@ targets:
   request_template:
     message: '{prompt}'
   response_path: result.answer
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata: {}
 - id: local_tools
   name: Local Tools (weather / stock / calc)
@@ -82,6 +98,10 @@ targets:
     extra_headers: {}
     type: none
   http_method: POST
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata:
     description: 'Gateway-side tool execution. Runs ATK-031..050 scenarios end-to-end:
 
@@ -100,46 +120,6 @@ targets:
     - weather_forecast
     - stock_quote
     - calc_evaluate
-- id: gemini_flash_test
-  name: Gemini Flash
-  type: api
-  enabled: true
-  endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent
-  timeout_seconds: 30.0
-  has_tools: false
-  auth:
-    extra_headers: {}
-    type: query
-    query_key: key
-    query_value_env: GEMINI_API_KEY
-  http_method: POST
-  request_template:
-    contents:
-    - parts:
-      - text: '{prompt}'
-  response_path: candidates.0.content.parts.0.text
-  metadata: {}
-- id: open_webui_api
-  name: Open WebUI (api)
-  type: api
-  enabled: true
-  endpoint: http://open-webui:8080/api/chat/completions
-  timeout_seconds: 60.0
-  has_tools: false
-  auth:
-    extra_headers: {}
-    type: bearer
-    token_env: MY_OPENWEBUI_KEY
-  http_method: POST
-  request_template:
-    model: qwen2.5:3b
-    messages:
-    - role: user
-      content: '{prompt}'
-    chat_id: uais-eval-probe
-    stream: false
-  response_path: choices.0.message.content
-  metadata: {}
 - id: open_webui_web
   name: Open WebUI (web)
   type: web
@@ -163,4 +143,55 @@ targets:
     - '#response-content-container'
     - p[dir="auto"]
     response_wait_ms: 8000
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
+  metadata: {}
+- id: gemini_flash_test
+  name: Gemini Flash
+  type: api
+  enabled: true
+  endpoint: https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent
+  timeout_seconds: 30.0
+  has_tools: false
+  auth:
+    extra_headers: {}
+    type: query
+    query_key: key
+    query_value_env: GEMINI_API_KEY
+  http_method: POST
+  request_template:
+    contents:
+    - parts:
+      - text: '{prompt}'
+  response_path: candidates.0.content.parts.0.text
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
+  metadata: {}
+- id: open_webui_api
+  name: Open WebUI (api)
+  type: api
+  enabled: true
+  endpoint: http://open-webui:8080/api/chat/completions
+  timeout_seconds: 60.0
+  has_tools: false
+  auth:
+    extra_headers: {}
+    type: bearer
+    token_env: MY_OPENWEBUI_KEY
+  http_method: POST
+  request_template:
+    model: qwen2.5:3b
+    messages:
+    - role: user
+      content: '{prompt}'
+    stream: false
+  response_path: choices.0.message.content
+  policy:
+    mode: passthrough
+    on_block: drop
+    on_sanitize: forward_marked
   metadata: {}

@@ -123,6 +123,45 @@ def test_get_run_summary_404_for_unknown(runs_client):
 
 
 # ---------------------------------------------------------------------------
+# /runs/start — Sprint 11 firewall flag wiring
+# ---------------------------------------------------------------------------
+class _NoopThread:
+    """Swallow the background subprocess so the route test stays hermetic."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def start(self):
+        pass
+
+
+def test_start_run_passes_firewall_flag(runs_client, monkeypatch):
+    client, _ = runs_client
+    import api.routes_runs as rr
+    monkeypatch.setattr(rr.threading, "Thread", _NoopThread)
+
+    r = client.post("/runs/start", json={
+        "target": "mock_echo", "suite": "prompt_injection",
+        "max_attacks": 1, "firewall": True, "run_id": "fw_route_on",
+    })
+    assert r.status_code == 200
+    assert "--firewall" in r.json()["command"]
+
+
+def test_start_run_omits_firewall_by_default(runs_client, monkeypatch):
+    client, _ = runs_client
+    import api.routes_runs as rr
+    monkeypatch.setattr(rr.threading, "Thread", _NoopThread)
+
+    r = client.post("/runs/start", json={
+        "target": "mock_echo", "suite": "prompt_injection",
+        "max_attacks": 1, "run_id": "fw_route_off",
+    })
+    assert r.status_code == 200
+    assert "--firewall" not in r.json()["command"]
+
+
+# ---------------------------------------------------------------------------
 # /reports
 # ---------------------------------------------------------------------------
 @pytest.fixture

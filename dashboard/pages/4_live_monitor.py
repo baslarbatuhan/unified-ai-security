@@ -95,7 +95,20 @@ if last_run_id:
         status = {}
     state = status.get("state", "?")
     badge = {"queued": ":hourglass:", "running": ":runner:", "done": ":white_check_mark:", "failed": ":x:"}.get(state, "")
-    st.info(f"{badge} Tracked run `{last_run_id}` — state: **{state}** ({status.get('updated_at', '')})")
+    # Sprint 11: surface firewall mode live from the launch command so the
+    # demo audience sees enforcement is ON while the run is in flight.
+    is_firewall = "--firewall" in str(status.get("command", ""))
+    mode_tag = " · 🛡️ **firewall**" if is_firewall else " · passthrough"
+    st.info(
+        f"{badge} Tracked run `{last_run_id}` — state: **{state}**{mode_tag} "
+        f"({status.get('updated_at', '')})"
+    )
+    if is_firewall:
+        st.caption(
+            "Firewall mode: prompts with a `block` verdict are stopped at the "
+            "gateway and never reach the target. Per-prompt forwarded/blocked "
+            "counts appear on the **Results** page once the run completes."
+        )
 
 # ---------------------------------------------------------------------------
 # Top-line counters — scope-aware

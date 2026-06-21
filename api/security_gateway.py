@@ -239,6 +239,7 @@ class SecurityGateway:
             evidence=all_evidence,
             module_risks=module_risks_parsed,
             latency_ms=latency_ms,
+            sanitized_prompt=getattr(engine_response, "sanitized_prompt", None),
         )
 
     def analyze_with_output(

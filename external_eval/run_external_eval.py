@@ -3,12 +3,23 @@
 Send an attack suite through a chatbot target and record the target's
 responses + gateway verdicts into telemetry + CSV.
 
-Flow per case:
+Flow per case (Sprint 11 — gateway analysis now runs FIRST):
     1. build adapter for the target
-    2. adapter.send(prompt)            ← external chatbot reply
-    3. FusionEngine.analyze(prompt)    ← our gateway's own verdict (optional)
-    4. emit RequestEvent + FusionDecisionEvent (Phase 0.1 telemetry)
-    5. append a row to runs/external_eval_results.csv
+    2. FusionEngine.analyze(prompt)    ← our gateway's verdict (required in
+                                          firewall mode, optional otherwise)
+    3. firewall_policy.decide(...)     ← forward or drop, per target policy
+    4. adapter.send(prompt) IF forwarded ← external chatbot reply; in firewall
+                                           mode a `block` verdict skips this
+                                           entirely (prompt never sent)
+    5. emit RequestEvent + FusionDecisionEvent telemetry
+    6. append a row to runs/external_eval_results.csv (incl. mode /
+       firewall_action / forwarded_to_target / adapter_state)
+
+Modes:
+    * passthrough (default) — always forward; gateway only observes (legacy
+      eval / observability behaviour).
+    * firewall (--firewall, or target policy.mode=firewall) — enforce the
+      verdict; blocked prompts are dropped before the adapter is touched.
 
 Usage
 -----
@@ -33,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -59,6 +71,7 @@ from schemas.telemetry_schema import (
 )
 from external_eval.target_loader import get_target
 from external_eval.adapter_factory import build_adapter
+from fusion_gateway import firewall_policy as fw
 from external_eval.attack_suites import (
     AttackCase,
     load_suite,
@@ -115,6 +128,11 @@ _CSV_FIELDS = [
     "tool_response_chars",
     "tool_response_preview",     # first 200 chars of JSON response
     "tool_error",                # any tool-level error message
+    # Sprint 11: firewall enforcement trace. Empty/legacy on passthrough rows.
+    "mode",                      # firewall | passthrough (effective per-target)
+    "firewall_action",           # forward | forward_marked | drop
+    "forwarded_to_target",       # 1 if the prompt actually reached the target
+    "adapter_state",             # ok | blocked_by_gateway_pre | target_error | ...
 ]
 
 
@@ -154,6 +172,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--no-gateway-analyze",
         action="store_true",
         help="Skip FusionEngine analysis; only collect chatbot replies.",
+    )
+    ap.add_argument(
+        "--firewall",
+        action="store_true",
+        help=(
+            "Enforce gateway verdicts (Sprint 11). A `block` verdict means the "
+            "prompt is NOT sent to the target. Override-only: promotes "
+            "passthrough targets to firewall but never downgrades a target "
+            "that set `policy.mode: firewall` in targets.yaml. Requires the "
+            "gateway (incompatible with --no-gateway-analyze for firewall targets)."
+        ),
     )
     ap.add_argument(
         "--output-csv",
@@ -245,10 +274,35 @@ def run(argv: Optional[List[str]] = None) -> int:
     started_at_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"[run] id={run_id} target={args.target} suite={args.suite} n_cases={len(cases)}")
 
+    # Warm rag_guard ahead of the attack loop only when the suite exercises
+    # it, so the first rag case doesn't pay BGE-M3 + Ollama judge cold-start
+    # inside the 30s budget (→ fail-closed timeout / 30-40s spike). The engine
+    # reads this env in its warm-up phase. Prompt-only / agency runs skip it.
+    if args.suite in ("rag_poisoning", "all"):
+        os.environ["UAIS_WARM_RAG"] = "1"
+
     gateway = None if args.no_gateway_analyze else _build_gateway()
     overrides = _load_overrides_from_yaml(args.config_yaml)
     if overrides:
         print(f"[run] applying overrides from {args.config_yaml}: {sorted(overrides.keys())}")
+
+    # Sprint 11: resolve the effective firewall policy. `--firewall` promotes
+    # passthrough targets but never downgrades a YAML firewall target.
+    policy = fw.resolve_policy(target, cli_firewall=args.firewall)
+    print(f"[run] policy mode={policy.mode} on_block={policy.on_block} on_sanitize={policy.on_sanitize}")
+
+    # Fail-closed: a firewall must not forward without a verdict. If the
+    # gateway is unavailable there is nothing to enforce → abort rather than
+    # silently letting prompts reach the target.
+    if policy.mode == "firewall" and gateway is None:
+        print(
+            "[error] firewall mode requires the gateway, but gateway analysis "
+            "is unavailable (--no-gateway-analyze or SecurityGateway failed to "
+            "load). Refusing to forward prompts unanalysed. Use passthrough "
+            "mode for gateway-less eval runs.",
+            file=sys.stderr,
+        )
+        return 2
 
     adapter = build_adapter(target)
     output_path = Path(args.output_csv)
@@ -282,6 +336,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         "gateway_sanitize": 0,
         "gateway_allow": 0,
         "gateway_miss": 0,
+        "firewall_blocked": 0,   # Sprint 11: prompts the firewall stopped pre-adapter
         "adapter_latency_sum_ms": 0,
         "gateway_latency_sum_ms": 0,
     }
@@ -312,15 +367,13 @@ def run(argv: Optional[List[str]] = None) -> int:
                     )
                 )
 
-                # 2. Send to target.
-                adapter_resp = adapter.send(case.prompt)
-                if adapter_resp.ok:
-                    summary["adapter_ok"] += 1
-                summary["adapter_latency_sum_ms"] += adapter_resp.latency_ms
-
-                # 3. Gateway analysis (optional).
+                # 2. Gateway analysis FIRST (Sprint 11). In firewall mode the
+                #    verdict gates whether the prompt is forwarded at all, so we
+                #    must analyse before touching the adapter. In passthrough
+                #    mode the ordering is irrelevant (we always forward).
                 gw_decision: Optional[str] = None
                 gw_decision_band: Optional[str] = None
+                gw_sanitized: Optional[str] = None
                 gw_fused = gw_prompt = gw_rag = gw_agency = 0.0
                 gw_latency_ms = 0
                 gw_evidence: List[str] = []
@@ -396,6 +449,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                         gw_latency_ms = int((time.time() - t_gw) * 1000)
                         gw_decision = _attr(gw_result, "final_decision") or _attr(gw_result, "decision")
                         gw_decision_band = _attr(gw_result, "decision_band", None)
+                        gw_sanitized = _attr(gw_result, "sanitized_prompt", None)
                         gw_fused = float(
                             _attr(gw_result, "fused_risk", None)
                             or _attr(gw_result, "fused_risk_score", 0.0)
@@ -445,6 +499,30 @@ def run(argv: Optional[List[str]] = None) -> int:
                 summary["gateway_miss"] += gateway_miss
 
                 # ------------------------------------------------------------------
+                # 3. Firewall decision + forward (or drop). Sprint 11.
+                #    In passthrough mode decide() always forwards (legacy
+                #    observability). In firewall mode a block/drop verdict
+                #    skips the adapter entirely — the prompt never leaves here.
+                # ------------------------------------------------------------------
+                verdict = fw.decide(gw_decision, policy, case.prompt, sanitized_prompt=gw_sanitized)
+                if verdict.evidence:
+                    gw_evidence.extend(verdict.evidence)
+                if verdict.forward:
+                    adapter_resp = adapter.send(
+                        verdict.prompt or case.prompt,
+                        session_context={"run_id": run_id},
+                    )
+                else:
+                    adapter_resp = fw.build_blocked_response(target.id, verdict)
+                if adapter_resp.ok:
+                    summary["adapter_ok"] += 1
+                summary["adapter_latency_sum_ms"] += adapter_resp.latency_ms
+                forwarded_to_target = 1 if verdict.forward else 0
+                adapter_state = fw.final_adapter_state(verdict, adapter_resp.ok)
+                if not verdict.forward:
+                    summary["firewall_blocked"] += 1
+
+                # ------------------------------------------------------------------
                 # Hafta 14: tools_local target → if the gateway allowed (or
                 # sanitised) the call, actually execute the tool via the local
                 # registry. BLOCK / no-tool-call cases skip execution.
@@ -457,6 +535,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                 if (
                     target.type == "tools_local"
                     and case.gateway_tool_call
+                    and verdict.forward
                     and gw_decision in ("allow", "sanitize")
                 ):
                     try:
@@ -510,6 +589,10 @@ def run(argv: Optional[List[str]] = None) -> int:
                     "tool_response_chars": tool_response_chars,
                     "tool_response_preview": tool_response_preview,
                     "tool_error": tool_error,
+                    "mode": policy.mode,
+                    "firewall_action": verdict.firewall_action,
+                    "forwarded_to_target": forwarded_to_target,
+                    "adapter_state": adapter_state,
                 }
                 writer.writerow(row)
                 run_rows.append(row)
@@ -543,6 +626,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         f"gw_sanitize={summary['gateway_sanitize']} "
         f"gw_allow={summary['gateway_allow']} "
         f"gateway_miss={summary['gateway_miss']} "
+        f"firewall_blocked={summary['firewall_blocked']} "
         f"avg_adapter_ms={summary['adapter_latency_sum_ms']//n} "
         f"avg_gateway_ms={summary['gateway_latency_sum_ms']//n}"
     )
@@ -577,6 +661,14 @@ def run(argv: Optional[List[str]] = None) -> int:
             sources={
                 "external_eval_results": str(output_path.name),
             },
+            # Sprint 11: persist firewall mode + enforcement count for the
+            # dashboard run list / Results header.
+            extra={
+                "mode": policy.mode,
+                "on_block": policy.on_block,
+                "on_sanitize": policy.on_sanitize,
+                "firewall_blocked": summary["firewall_blocked"],
+            },
         )
         _wm_append_registry(
             runs_dir,
@@ -589,6 +681,7 @@ def run(argv: Optional[List[str]] = None) -> int:
             n_cases=len(cases),
             n_rows=len(run_rows),
             relative_path=str(run_dir.relative_to(runs_dir.parent)),
+            mode=policy.mode,
         )
         print(f"[manifest] wrote {run_dir}/results.csv + manifest.json + registry entry")
     except Exception as exc:  # noqa: BLE001 — manifest is best-effort

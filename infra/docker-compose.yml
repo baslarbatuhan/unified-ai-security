@@ -158,6 +158,14 @@ services:
     container_name: uais-ollama
     ports:
       - "11435:11434"
+    environment:
+      # Keep loaded models resident in (V)RAM for 30 min after last use so
+      # rag_guard's judge (qwen2.5:7b) and the Open WebUI target (qwen2.5:3b)
+      # don't reload between cases/runs. Eliminates the cold-start latency
+      # spike on the first rag case. Use "-1" to keep forever, or a shorter
+      # window to free memory sooner. The LLM judge also sets keep_alive
+      # per-request, but this covers the target model + any other caller.
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped

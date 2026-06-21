@@ -32,16 +32,30 @@ Rate limiting is applied in `api/middleware.py` (applies to dashboard routes as 
 
 `external_eval/run_external_eval.py` produces `runs/external_eval_results.csv` with a `gateway_miss` column: it flags when the **expected** decision is `block` or `sanitize` but the gateway returned `allow`. This is a **protector** metric, not the same as RAG retrieval “attack success rate” (ASR) in `rag_guard/rag_baseline.py`.
 
+### Enforcement: passthrough vs firewall (Sprint 11)
+
+Each target carries a `policy` block (`mode`, `on_block`, `on_sanitize`). The runner analyses the prompt **first**, then a shared, side-effect-free helper (`fusion_gateway/firewall_policy.py`) decides whether the adapter is called:
+
+| `policy.mode` | Behaviour |
+|---|---|
+| `passthrough` (default) | The prompt is always forwarded; the gateway verdict is recorded for observability (used for the Open WebUI A/B, where gateway behaviour is compared with the model's native refusal). |
+| `firewall` (per target, or the runner's `--firewall` flag / dashboard toggle) | A `block` verdict **short-circuits the case — the adapter is never invoked**, so the prompt never reaches the target. `sanitize` is handled per `on_sanitize` (`drop` / `forward_marked` / `forward_strip`, the last forwarding the gateway's cleaned `sanitized_prompt`). Fail-closed: with no gateway there is no verdict, so the run aborts. |
+
+Every row records four enforcement columns — `mode`, `firewall_action`, `forwarded_to_target`, `adapter_state` (`ok` / `blocked_by_gateway_pre` / `target_error`) — surfaced on the dashboard's Results and Compare-Runs pages.
+
 ### Target adapter axis
 
-`schemas/target_schema.py::TargetConfig` has three `type` values, each backed by an adapter in `external_eval/`:
+`schemas/target_schema.py::TargetConfig` has four `type` values, each backed by an adapter in `external_eval/`:
 
 | `type` | Adapter | Required fields | Optional fields |
 |---|---|---|---|
 | `api` (POST) | `APIAdapter` | `endpoint` | `request_template` (JSON body w/ `{prompt}`), `response_path`, `auth` |
 | `api` (GET) | `APIAdapter` | `endpoint`, `query_template` | `response_path`, `auth` |
 | `web` | `WebAdapter` (Playwright) | `endpoint`, `selectors.input`, `selectors.response` | `selectors.submit`, `selectors.response_wait_ms`, fallbacks |
+| `tools_local` | `ToolAdapter` | (none) | `has_tools: true` — gateway pre-screens the tool call, then the runner invokes the registered Python tool (weather / stock / calc) |
 | `mock` | `MockAdapter` | (none) | `metadata` |
+
+Authentication is a discriminated `AuthConfig` union with six variants (`none`, `bearer`, `header`, `query`, `basic`, `cookie`); secrets resolve via env → file-locked vault (`runs/.secrets.yaml`) → empty, with `${VAR}` interpolation in header/cookie values. Open WebUI `api` targets (`metadata.openwebui: true`) additionally mirror each forwarded prompt + reply into a sidebar-visible chat via `external_eval/openwebui_chat.py`.
 
 The `api` type uses `http_method: "POST" \| "GET"` (default `POST`) to switch between body-style and query-style requests. POST uses `request_template`; GET uses `query_template` (flat dict, values may contain `{prompt}` and `{role}`). Plain-text responses are returned as-is when `response_path` is blank and `Content-Type` is not JSON; setting `response_path` on a non-JSON endpoint raises `AdapterError` so the misconfiguration is loud, not silent.
 

@@ -245,6 +245,57 @@ class RateLimit(BaseModel):
     burst: int = Field(default=10, ge=1)
 
 
+# ---------------------------------------------------------------------------
+# Sprint 11 — Firewall policy (per-target enforcement)
+# ---------------------------------------------------------------------------
+# Two operating modes decide whether a gateway verdict *enforces* or merely
+# *observes*:
+#
+#   * passthrough — eval / observability mode (legacy default). The prompt is
+#     always forwarded to the target; the gateway verdict is recorded but not
+#     enforced. Existing eval runs and the 571-test baseline rely on this.
+#   * firewall — production mode. A `block` verdict means the prompt NEVER
+#     reaches the target (no API call, no browser keystroke). `sanitize` is
+#     handled per `on_sanitize`.
+#
+# Default is `passthrough` so existing targets/tests are unaffected; opt into
+# firewall per-target (this schema) or globally via the runner's `--firewall`
+# flag (override-only — it cannot *downgrade* a target already set to firewall).
+
+PolicyMode = Literal["firewall", "passthrough"]
+# MVP: blocking is binary — a blocked prompt is dropped (adapter skipped).
+# `forward_advisory`/`forward_strip` round out the sanitize axis but strip
+# depends on prompt_sanitizer wiring (deferred); the runner degrades strip
+# to `forward_marked` at runtime and records evidence.
+OnBlockAction = Literal["drop"]
+OnSanitizeAction = Literal["drop", "forward_advisory", "forward_marked", "forward_strip"]
+
+
+class TargetPolicy(BaseModel):
+    """Per-target firewall policy. Defaults to observability (passthrough)."""
+
+    mode: PolicyMode = Field(
+        default="passthrough",
+        description=(
+            "passthrough = always forward, gateway only observes (eval). "
+            "firewall = enforce verdicts, block → adapter never called."
+        ),
+    )
+    on_block: OnBlockAction = Field(
+        default="drop",
+        description="What a firewall `block` verdict does. MVP: only `drop`.",
+    )
+    on_sanitize: OnSanitizeAction = Field(
+        default="forward_marked",
+        description=(
+            "What a firewall `sanitize` verdict does: drop (treat like block), "
+            "forward_marked (prepend a warning banner), forward_strip (mutate — "
+            "degrades to forward_marked until sanitizer is wired), "
+            "forward_advisory (deferred → degrades to forward_marked)."
+        ),
+    )
+
+
 class TargetConfig(BaseModel):
     id: str = Field(
         ...,
@@ -326,6 +377,12 @@ class TargetConfig(BaseModel):
     selectors: Optional[WebSelectors] = None
 
     rate_limit: Optional[RateLimit] = None
+
+    # Sprint 11 — firewall enforcement policy. Defaults to passthrough so
+    # existing targets keep their observability behaviour; production targets
+    # opt into `mode: firewall` to stop blocked prompts at the gateway.
+    policy: TargetPolicy = Field(default_factory=TargetPolicy)
+
     # Free-form metadata for dashboards (tags, notes).
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -374,6 +431,10 @@ __all__ = [
     "TargetType",
     "WebSelectors",
     "RateLimit",
+    "TargetPolicy",
+    "PolicyMode",
+    "OnBlockAction",
+    "OnSanitizeAction",
     "TargetConfig",
     "TargetsFile",
     "AuthConfig",

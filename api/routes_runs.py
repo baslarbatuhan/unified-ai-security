@@ -168,6 +168,15 @@ class StartRunRequest(BaseModel):
     suite: str = Field("prompt_injection", description="Attack suite name.")
     max_attacks: int = Field(0, ge=0, description="0 = all cases in the suite.")
     target_has_tools: bool = Field(False, description="Override the target_has_tools gate.")
+    firewall: bool = Field(
+        False,
+        description=(
+            "Sprint 11: enforce gateway verdicts. When true the runner is "
+            "launched with --firewall so `block` verdicts stop the prompt "
+            "before the adapter is called. Override-only — never downgrades a "
+            "target whose YAML sets policy.mode=firewall."
+        ),
+    )
     run_id: Optional[str] = Field(None, description="Optional explicit run_id; auto-generated otherwise.")
     config_snapshot_path: Optional[str] = Field(
         None,
@@ -236,6 +245,8 @@ def start_run(req: StartRunRequest) -> Dict[str, Any]:
     ]
     if req.target_has_tools:
         cmd.append("--target-has-tools")
+    if req.firewall:
+        cmd.append("--firewall")
     # Default to the snapshot the dashboard wrote; explicit path wins.
     snapshot = req.config_snapshot_path or str(_RUNS_DIR / run_id / "config_used.yaml")
     if Path(snapshot).exists():

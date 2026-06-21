@@ -126,6 +126,10 @@ class ModuleRisk:
     decision: Decision = "allow"
     evidence: List[str] = field(default_factory=list)
     latency_ms: Optional[int] = None
+    # prompt_guard only: the sanitize-stage output (malicious segments
+    # stripped). Surfaced on a `sanitize` verdict so the firewall can forward
+    # the cleaned prompt instead of the raw one. None for other modules.
+    sanitized_prompt: Optional[str] = None
 
 
 @dataclass
@@ -148,6 +152,10 @@ class FusionEngineResponse:
     # 4-class score band — `flag` here means suspicion-tier block (see
     # `_collapse_band`). Always present so consumers don't branch on absence.
     decision_band: DecisionBand = "allow"
+    # Set only on a `sanitize` verdict: the prompt with malicious segments
+    # stripped (from prompt_guard's sanitize stage). The firewall forwards
+    # this instead of the raw prompt when on_sanitize=forward_strip.
+    sanitized_prompt: Optional[str] = None
 
     def to_dict(self) -> Dict:
         return {
@@ -156,6 +164,7 @@ class FusionEngineResponse:
             "module_risks": self.module_risks,
             "latency_ms": self.latency_ms,
             "decision_band": self.decision_band,
+            "sanitized_prompt": self.sanitized_prompt,
         }
 
 
@@ -333,6 +342,7 @@ def _evaluate_prompt_guard(user_input: str) -> ModuleRisk:
             decision=risk_dict["decision"],
             evidence=risk_dict["evidence"],
             latency_ms=int((time.time() - t0) * 1000),
+            sanitized_prompt=risk_dict.get("sanitized_prompt"),
         )
     except Exception as e:
         return ModuleRisk(
@@ -1015,6 +1025,35 @@ class FusionEngine:
             flush=True,
         )
 
+        # Phase 3 — RAG pipeline (gated). Only warm when the run will actually
+        # exercise rag_guard (the runner sets UAIS_WARM_RAG=1 for rag suites),
+        # so prompt-only / agency runs don't pay the ~15-20s BGE-M3 + Ollama
+        # judge cold-start they'd never use.
+        #
+        # Without this, the FIRST rag_poisoning case loads BGE-M3, encodes the
+        # poison-signature corpus, and primes the Ollama judge INSIDE the 30s
+        # rag_guard budget → it overshoots, fail-closes (rs=1.0), and shows up
+        # as a 30-40s spike / timeout block. Doing it here moves that one-time
+        # cost ahead of the attack loop so every case (incl. the first) pays
+        # only steady-state latency.
+        if os.getenv("UAIS_WARM_RAG") == "1":
+            t_rag = time.time()
+            print("[FusionEngine] warm-up: loading rag_guard pipeline (BGE + judge)...",
+                  file=sys.stderr, flush=True)
+            try:
+                rag = _get_rag_pipeline()
+                rag.run(
+                    [{"doc_id": "warmup_doc", "content": "Warmup document for RAG guard."}],
+                    user_query="warmup query",
+                )
+            except Exception as exc:  # noqa: BLE001 — warm-up never blocks startup
+                print(f"[FusionEngine] rag_guard warm-up failed (continuing lazy): {exc}",
+                      file=sys.stderr, flush=True)
+            else:
+                rag_ms = int((time.time() - t_rag) * 1000)
+                print(f"[FusionEngine] warm-up: rag_guard primed in {rag_ms}ms",
+                      file=sys.stderr, flush=True)
+
     def analyze(
         self,
         user_input: str = "",
@@ -1148,6 +1187,11 @@ class FusionEngine:
             final_decision=final_decision,
             decision_band=band,
             fused_risk=fused,
+            # Expose the sanitized prompt only when the verdict is `sanitize`
+            # so the firewall's forward_strip can forward the cleaned prompt.
+            sanitized_prompt=(
+                prompt_risk.sanitized_prompt if final_decision == "sanitize" else None
+            ),
             module_risks=[
                 {"module": "prompt_guard", "risk_score": prompt_risk.risk_score,
                  "confidence": prompt_risk.confidence, "decision": prompt_risk.decision,
