@@ -1,135 +1,167 @@
-# Unified AI Security Gateway
+<div align="center">
 
-Unified gateway for defending LLM applications against:
-- prompt injection / jailbreak attempts
-- RAG poisoning and context manipulation
-- tool misuse (IDOR, enumeration, param abuse, role misuse)
-- model output risks (leaked PII/secrets, unsafe instructions, redirect/injection) via **output guard**
+# 🛡️ Unified AI Security Gateway
 
-The system runs **input-side** module pipelines in parallel and fuses their scores into a single decision. A separate **post-LLM** path runs the same input modules **plus** output text analysis (output guard).
+**A multi-layer defense framework for Large Language Model applications.**
 
-## Architecture
+One gateway that screens prompts, retrieved context, tool calls, and model output —
+fuses the evidence into a single verdict, and (optionally) *enforces* it before the
+request ever reaches your chatbot.
 
-**Pre-LLM (input screening)** — client sends the user prompt and context; the gateway does *not* call the target LLM.
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)
+![Streamlit](https://img.shields.io/badge/dashboard-Streamlit-FF4B4B?logo=streamlit&logoColor=white)
+![Docker](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-608%20passing-brightgreen)
+![Status](https://img.shields.io/badge/status-capstone%20project-blueviolet)
+
+</div>
+
+---
+
+## ✨ What it defends against
+
+| Threat surface | Module | Techniques |
+|---|---|---|
+| 🧬 **Prompt injection / jailbreak** | Prompt Guard | deobfuscation → NFKC normalize → BGE-M3 semantic + regex → sanitize |
+| 📄 **RAG poisoning / context hijack** | RAG Guard | embedding detector + **LLM judge** + chunked analysis + context filter |
+| 🔧 **Tool misuse** (IDOR/BOLA, enumeration, param abuse, role misuse) | Agency Defense | object authz + **stateful** anti-enum + param validator + behavior signals |
+| 🕵️ **Output-layer leakage** (PII, secrets, unsafe prose, redirects) | Output Guard | regex + entropy on the model completion (`/analyze-output`) |
+| 🧠 **Single-module dilution** | Fusion Gateway | weighted sum + critical/elevated **max-rule override** |
+
+The system runs the input-side modules **in parallel** and fuses their scores into one
+decision (`allow` / `sanitize` / `flag` / `block`). A separate post-LLM path adds output
+analysis. For external targets it supports two enforcement modes:
+
+| Mode | Behaviour |
+|------|-----------|
+| **Passthrough** *(default)* | Every prompt reaches the chatbot; the gateway scores and logs only (observability / RLHF comparison). |
+| **🔥 Firewall** (`--firewall` or `target.policy.mode: firewall`) | Gateway runs **first**; a `block` verdict **skips the adapter — the prompt never reaches the target**. |
+
+---
+
+## 📑 Table of Contents
+
+- [Architecture](#-architecture)
+- [Quick Start](#-quick-start)
+- [External Evaluation & Firewall](#-external-evaluation--firewall)
+- [Dashboard](#-dashboard)
+- [Configuration](#-configuration)
+- [Tests](#-tests)
+- [Project Layout](#-project-layout)
+- [Documentation](#-documentation)
+
+---
+
+## 🏗 Architecture
+
+**Pre-LLM (input screening)** — the gateway scores the prompt/context; it does *not* call the target LLM.
 
 ```
 POST /analyze
-    |
-    +--> Prompt Guard   (deobfuscate -> normalize -> semantic/pattern -> sanitize)
-    +--> RAG Guard      (poison detector -> LLM judge -> retrieval risk -> context filter)
-    +--> Agency Defense (tool/authz -> anti-enum -> param validation -> behavior signals; tool-call path)
-                  |
-                  v
+    │
+    ├─▶ Prompt Guard   (deobfuscate → normalize → semantic/pattern → sanitize)
+    ├─▶ RAG Guard      (poison detector → LLM judge → retrieval risk → context filter)
+    └─▶ Agency Defense (tool/authz → anti-enum → param validation → behavior)
+                  │
+                  ▼
           Fusion Gateway (weighted sum + max-rule override)
-                  |
-                  v
-      allow / sanitize / flag / block     (response: output_score = 0.0 on this path)
+                  │
+                  ▼
+      allow / sanitize / flag / block      (output_score = 0.0 on this path)
 ```
 
-**Post-LLM (output screening)** — after the *client* calls its own LLM, the client posts the model completion for the same request shape:
+**Post-LLM (output screening)** — after the *client* calls its own LLM, it posts the completion:
 
 ```
 POST /analyze-output  (requires model_output)
-    |
-    +--> same three input-side modules (stateless re-check)
-    +--> Output Guard   (regex/entropy: PII, API-key-like tokens, unsafe text, injection, off-allowlist URLs)
-                  |
-                  v
-          Fusion (four modules; output_score reflects output_guard contribution)
-                  |
-                  v
-      allow / sanitize / flag / block
+    │
+    ├─▶ same three input-side modules (stateless re-check)
+    └─▶ Output Guard   (PII, API-key-like tokens, unsafe text, injection, off-allowlist URLs)
+                  │
+                  ▼
+          Fusion (four modules; output_score reflects output_guard)
 ```
 
-**Dashboard** is a Streamlit app (`dashboard/app.py`) that talks to the gateway over HTTP and uses both read and write routes:
-
-- **Read-only** (polled): `GET /dashboard/*` (summary, alerts, recent-runs, breakers, metrics), `GET /runs`, `GET /reports`, `GET /targets`, `GET /health`.
-- **Mutating** (button-driven): `POST /analyze`, `POST /analyze-output`, `POST /runs/start`, `POST /reports/regenerate`, `POST /targets`, `DELETE /targets/{id}`.
-
-Run it as a sibling process to the gateway. See `reports/ops_notes.md` for operational limits and deferred work.
-
-## Core Components
-
-- `api/api_main.py`: FastAPI app (`POST /analyze`, `POST /analyze-output`, `GET /health`)
-- `api/security_gateway.py`: `analyze()` and `analyze_with_output()`; telemetry (`FusionDecisionEvent` includes `output_score` on the post-LLM path)
-- `api/dashboard_routes.py` + `api/middleware.py`: read-only dashboard JSON, rate limits
-- `fusion_gateway/engine.py`: module execution + fusion; `analyze()` vs `analyze_with_output()` (adds `output_guard`)
-- `prompt_guard/pipeline.py`: full prompt defense pipeline
-- `rag_guard/pipeline.py`: hybrid RAG defense pipeline
-- `output_agency_defense/*`: agency / tool-call protections
-- `output_guard/output_analyzer.py`: post-hoc model *text* risk (used on `/analyze-output` and in batch eval)
-- `external_eval/run_external_eval.py`: live-target harness; CSV includes `gateway_miss` (see glossary / ops notes)
-- `schemas/risk_schema.py`: common request/response schema
-
-## Repository Layout
+**External evaluation per case (gateway-first, then enforce):**
 
 ```
-unified-ai-security/
-├── api/                 # FastAPI, dashboard routes, security gateway, middleware
-├── dashboard/            # Streamlit UI (app.py + pages/)
-├── configs/
-├── datasets/
-├── evaluation/           # attack suite, metrics, ablations
-├── external_eval/      # adapters + run_external_eval (targets, gateway_miss CSV)
-├── fusion_gateway/
-├── output_guard/         # output_analyzer + metrics writer
-├── output_agency_defense/
-├── prompt_guard/
-├── rag_guard/
-├── schemas/
-├── tests/
-├── infra/
-├── runs/                 # generated CSV/JSON (metrics, attack results, telemetry log path)
-└── reports/              # generated analyses; ops_notes.md = ops/deployment notes
+load_suite() ─▶ for each AttackCase:
+    gateway.analyze(prompt)          # verdict FIRST
+    firewall_policy.decide(...)      # forward or drop (per target policy)
+    adapter.send(prompt)             # only if forwarded
+    └─▶ runs/<run_id>/results.csv
 ```
 
-## Quick Start
+---
 
-### Option A — Docker (recommended, no host setup)
+## 🚀 Quick Start
 
-`docker compose up` brings the whole stack online with the same surface
-as a local run: gateway on `:8000`, dashboard on `:8501`, plus Chroma
-and Ollama for RAG/judge. State (target YAML, generated CSVs) is
-bind-mounted to the host so it survives container restarts.
+### Option A — Docker (recommended)
 
 ```bash
-git clone https://github.com/<user>/unified-ai-security.git
+git clone https://github.com/baslarbatuhan/unified-ai-security.git
 cd unified-ai-security/infra
-cp .env.example .env          # fill in HF_TOKEN / API keys if you have them
-docker compose up -d
-# gateway   → http://localhost:8000
-# dashboard → http://localhost:8501
-docker compose logs -f gateway   # warmup takes ~60-90 s on first boot
+cp .env.example .env          # optional: HF_TOKEN, MY_OPENWEBUI_KEY, …
+docker compose up -d --build
 ```
 
-GPU (NVIDIA host with the Container Toolkit):
+| Service | URL |
+|---------|-----|
+| 🛡️ Gateway (FastAPI) | http://localhost:8000 |
+| 📊 Dashboard (Streamlit) | http://localhost:8501 |
+| 💬 Open WebUI (demo target) | http://localhost:3000 |
+| 🗂️ ChromaDB | localhost:8001 |
+| 🦙 Ollama | localhost:11435 |
+
+> First boot: gateway warm-up takes ~60–90 s (`UAIS_WARM_UP_PIPELINES=1` in compose).
+
+Pull the Ollama models once:
+
+```bash
+docker exec uais-ollama ollama pull qwen2.5:7b   # RAG judge
+docker exec uais-ollama ollama pull qwen2.5:3b   # Open WebUI chat target
+```
+
+**GPU** (NVIDIA + Container Toolkit):
 
 ```bash
 docker compose -f docker-compose.yml \
                -f docker-compose.override.yml \
-               -f docker-compose.gpu.yml up -d
+               -f docker-compose.gpu.yml up -d --build
 ```
 
-Stop with `docker compose down` (`-v` also drops the chroma/ollama
-volumes; omit if you want the LLM weights to survive).
+<details>
+<summary><b>Open WebUI as a live target (API + web)</b></summary>
+
+API target — Open WebUI → Settings → Account → API key, then add to `infra/.env`:
+
+```bash
+MY_OPENWEBUI_KEY=sk-...
+```
+
+…or paste it via Dashboard → **Targets** vault (`runs/.secrets.yaml`, never committed).
+
+Web target (Playwright) — export the login state once:
+
+```bash
+python scripts/export_webui_state.py --url http://localhost:3000 --out runs/open_webui_state.json
+```
+</details>
 
 ### Option B — Local Python venv
 
+Requires Python **3.10+** (the Docker image uses 3.11).
+
 ```bash
-git clone https://github.com/<user>/unified-ai-security.git
-cd unified-ai-security
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-cp .env.example .env
-```
+playwright install chromium      # only for type=web targets
 
-Run gateway:
-
-```bash
-uvicorn api.api_main:app --host 0.0.0.0 --port 8000
+uvicorn api.api_main:app --host 0.0.0.0 --port 8000   # gateway
+streamlit run dashboard/app.py                         # dashboard (2nd terminal)
 ```
 
 Smoke test:
@@ -145,80 +177,118 @@ curl -s -X POST http://localhost:8000/analyze \
   }' | python3 -m json.tool
 ```
 
-Post-LLM check (body matches `/analyze` plus `model_output` — use a real completion string in production tests):
+---
+
+## 🔥 External Evaluation & Firewall
+
+Run an attack suite against a registered target (gateway must be up). Targets live in
+`external_eval/targets.yaml` and can be edited from the dashboard.
 
 ```bash
-curl -s -X POST http://localhost:8000/analyze-output \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Summarize our refund policy",
-    "model_output": "Contact support at leaked@example.com for full card 4111111111111111.",
-    "session_context": {"user_id": "u1", "role": "basic"}
-  }' | python3 -m json.tool
+# Observability (default): every prompt reaches the chatbot
+python external_eval/run_external_eval.py --target open_webui_api --suite prompt_injection --max-attacks 10
+
+# Firewall: a `block` verdict means the prompt is NEVER sent to the target
+python external_eval/run_external_eval.py --target open_webui_api --suite prompt_injection --firewall
 ```
 
-**Dashboard UI:** with the gateway running, start the Streamlit app in a second terminal:
+Or set `policy.mode: firewall` on the target, or use Dashboard → **Run test** → **Firewall** toggle.
 
-```bash
-streamlit run dashboard/app.py
-```
+- **Suites:** `prompt_injection`, `rag_poisoning`, `agency_social`, `all` (+ single-prompt mode in the dashboard).
+- **Adapters:** `api` (REST), `web` (Playwright), `tools_local` (real Python tool dispatch), `mock`.
+- **Auth:** six variants — `none`, `bearer`, `header`, `query`, `basic`, `cookie` — secrets resolved via env → file-locked vault → `${VAR}` interpolation.
+- **CSV trace:** `gateway_decision`, `gateway_miss`, plus firewall columns `mode`, `firewall_action`, `forwarded_to_target`, `adapter_state`.
 
-It opens at `http://localhost:8501/` and polls the gateway's read-only `/dashboard/*` routes for summary, telemetry tails, and CSVs under `runs/`. Buttons (Run test, Regenerate report, Save target, Delete target) trigger the corresponding `POST`/`DELETE` endpoints listed in *Architecture Snapshot* above.
+> `forwarded_to_target = 0` + `adapter_state = blocked_by_gateway_pre` = the firewall stopped the prompt before the chatbot was ever called.
 
-## Evaluation Scripts
+---
 
-Main scripts in `evaluation/`:
-- `run_attack_suite.py`: HTTP attack suite through live gateway
-- `attack_failure_analysis.py`: summarize escaped attacks
-- `generate_metrics.py`: module-level metrics CSVs
-- `measure_latency_breakdown.py`: prompt/rag/fusion stage latency
-- `rag_weight_optimization.py`: embedding vs judge weight sweep
-- `tune_prompt_threshold.py`: prompt threshold tuning
-- `behavior_weight_calibration.py`: behavior signal weight calibration
-- `tune_agency_behavior_weights.py`: behavior weight grid search
-- `agency_llm_stress_test.py`: real LLM tool-calling stress test
-- `ablation_analysis.py`: no-judge/no-deobfuscator/no-behavior analysis
-- `run_experiments.py`: batch run of core module tests
-- `security_healthcheck.py`: structural/guard health report
+## 📊 Dashboard
 
-Typical run:
+A nine-page Streamlit app (`dashboard/app.py`) that talks to the gateway over read-only HTTP:
 
-```bash
-python evaluation/run_attack_suite.py --url http://127.0.0.1:8000 --seed 42
-python evaluation/attack_failure_analysis.py
-```
+| Page | What it shows |
+|---|---|
+| **Admin** | `/health` checks, circuit-breaker & rate-limiter state, raw telemetry tail |
+| **Home** | composite security score, KPI strip, attack-class distribution |
+| **Targets** | CRUD + 9 provider presets, 🔐 secret vault, test-connection diagnostics |
+| **Run test** | single-shot `/analyze`(`-output`) **or** suite runs with **firewall toggle** + coupled weight sliders |
+| **Live monitor** | per-module risk/latency tail, global vs. per-run scope |
+| **Results** | per-run analytics, **firewall enforcement strip**, FN/FP inspector, decision-trace drill-down |
+| **Logs** | per-decision explainability (which signal fired and why) |
+| **Reports** | view / regenerate / download Markdown + PDF reports |
+| **Compare runs** | side-by-side diff incl. **passthrough-vs-firewall** enforcement section |
 
-## Security Modules
+---
 
-| Module | Main Threats | Key Techniques |
+## ⚙️ Configuration
+
+| File | Purpose |
+|---|---|
+| `configs/secure_balanced.yaml` | fusion weights, thresholds, RAG judge settings |
+| `configs/timeout_config.yaml` | per-module budgets + fail-closed policies |
+| `configs/service_limits.yaml` | rate limits & eval parallelism |
+| `configs/security_score_weights.yaml` | Home-page composite-score weights |
+
+**Key environment variables**
+
+| Variable | Where | Purpose |
 |---|---|---|
-| Prompt Guard | jailbreak, obfuscation, instruction override | deobfuscation, adaptive semantic threshold, regex patterns, sanitization |
-| RAG Guard | poisoned docs, retrieval hijack, subtle corruption | embedding detector + LLM judge + robust retrieval scoring + context filtering |
-| Agency Defense | IDOR/BOLA, sequential probing, bad params, role abuse | object authz, anti-enum, parameter validator, behavior monitor/risk model (tool-call path) |
-| Output Guard | PII/secret leakage, unsafe model prose, agent hijack, unknown redirects | pattern + entropy heuristics on `model_output` (only in `analyze_with_output` / batch scripts) |
-| Fusion | single-module dilution | weighted sum + critical/elevated max-rule override |
+| `HF_TOKEN` | `.env` | Faster Hugging Face model downloads |
+| `UAIS_WARM_UP_PIPELINES=1` | compose (gateway) | Eager-load BGE-M3 + pipelines at startup |
+| `OLLAMA_HOST` | gateway | Ollama endpoint (compose: `http://ollama:11434`) |
+| `OLLAMA_KEEP_ALIVE` | compose (ollama) | Keep models resident (default `30m`) so the first RAG case skips cold-start |
+| `MY_OPENWEBUI_KEY` | `.env` or vault | Bearer token for the `open_webui_api` target |
+| `GATEWAY_URL` | dashboard | Gateway base URL (compose: `http://gateway:8000`) |
 
-## Config Highlights
+Target credentials use `auth.token_env: <NAME>` in `targets.yaml`; values come from the
+environment or the file-locked vault `runs/.secrets.yaml` (never committed).
 
-`configs/secure_balanced.yaml` controls:
-- fusion weights and thresholds
-- max-rule override multipliers
-- prompt adaptive thresholds
-- RAG poison threshold, judge weights, context filter thresholds
-- active Ollama model and fallback
+---
 
-## Environment Variables
+## 🧪 Tests
 
-Common variables:
-- `HF_TOKEN`: optional, faster Hugging Face model download
-- `OLLAMA_HOST`: default `http://localhost:11434`
-- `LLM_JUDGE_MODEL`: optional override for judge model
-- `STRICT_SECURITY_STARTUP`: fail app startup on self-check errors when true
+```bash
+pytest tests/ -q          # 609 collected · 608 pass · 1 skip
+```
 
-## Notes
+---
 
-- `runs/` and `reports/` are generated artifacts.
-- First request is slower due to model warmup; `api/startup.py` preloads models at app startup.
-- Telemetry (e.g. fusion decisions) is written for observability; dashboard read paths are full-file tail today — when to optimize is documented in `reports/ops_notes.md`.
-- External eval CSV column `gateway_miss` counts cases where the gateway *allowed* traffic that should have been blocked/sanitized; it is **not** the same as RAG “attack success rate” (ASR) in `rag_guard/rag_baseline.py`.
-- Project layout and setup: `PROJECT_STRUCTURE.md`, `SETUP.md`, `docs/architecture_v1.md`, `docs/design_decisions.md`.
+## 🗂 Project Layout
+
+```
+unified-ai-security/
+├── api/                    # FastAPI gateway, routes, middleware
+├── dashboard/              # Streamlit UI (app.py + pages/ + lib/)
+├── fusion_gateway/         # parallel module execution, fusion, firewall_policy
+├── prompt_guard/           # deobfuscator, semantic eval, patterns, sanitizer
+├── rag_guard/              # poison detector, LLM judge, retrieval risk, filter
+├── output_agency_defense/  # object authz, anti-enum, param validator
+├── output_guard/           # PII / secret / unsafe-text scanners
+├── external_eval/          # adapters, targets.yaml, run_external_eval.py
+├── tools/                  # local tool registry (tools_local target)
+├── schemas/                # request/response + target schemas
+├── configs/ · utils/ · evaluation/ · scripts/ · datasets/
+├── tests/                  # 609 tests
+├── infra/                  # docker-compose*.yml, .env.example
+├── docs/                   # architecture, threat models, design decisions
+├── runs/ · reports/        # generated artefacts (gitignored)
+```
+
+---
+
+## 📚 Documentation
+
+- **[SETUP.md](SETUP.md)** — install, Docker, Open WebUI, troubleshooting
+- **[PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)** — file map, data flow, CSV columns
+- **[docs/architecture_v1.md](docs/architecture_v1.md)** — HTTP routes, adapter axis, enforcement
+- **[docs/glossary.md](docs/glossary.md)** — `gateway_miss` vs ASR, key terms
+
+---
+
+<div align="center">
+
+*Capstone project · Department of Computer Engineering, İstanbul Kültür University.*
+*`gateway_miss` is a **protector** metric (expected block/sanitize but gateway allowed) — not a RAG retrieval attack-success rate.*
+
+</div>

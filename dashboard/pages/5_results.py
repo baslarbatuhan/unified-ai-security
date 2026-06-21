@@ -207,6 +207,40 @@ with tab_overview:
     o5.metric("Miss", miss_n, help="gateway_miss=1: expected block/sanitize but gateway returned allow.")
     o6.metric("Avg latency", f"{avg_lat:.0f} ms")
 
+    # --- Sprint 11: firewall enforcement strip ---------------------------
+    # Distinguishes "gateway verdict" (always recorded) from "enforcement"
+    # (did the prompt actually reach the target?). Only shown when the run
+    # carries the Sprint-11 columns — older runs degrade silently.
+    if "forwarded_to_target" in filtered.columns or "mode" in filtered.columns:
+        mode_vals = [m for m in filtered.get("mode", pd.Series(dtype=str)).astype(str).unique() if m]
+        mode = mode_vals[0] if len(mode_vals) == 1 else ("mixed" if mode_vals else "—")
+        fwd = pd.to_numeric(filtered.get("forwarded_to_target", pd.Series(dtype=int)), errors="coerce").fillna(0)
+        forwarded_n = int((fwd == 1).sum())
+        stopped_n = int((fwd == 0).sum())
+        blocked_pre = int(
+            (filtered.get("adapter_state", pd.Series(dtype=str)).astype(str) == "blocked_by_gateway_pre").sum()
+        )
+
+        st.subheader("🛡️ Firewall enforcement")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Mode", mode)
+        f2.metric("Forwarded → target", forwarded_n,
+                  help="Prompts that actually reached the target adapter.")
+        f3.metric("Stopped before target", stopped_n,
+                  help="Prompts the firewall did not forward (forwarded_to_target=0).")
+        f4.metric("Blocked pre-adapter", blocked_pre,
+                  help="adapter_state=blocked_by_gateway_pre — gateway blocked before any target call.")
+        if mode == "firewall":
+            st.success(
+                f"Firewall ON — **{stopped_n}** prompt(s) were stopped at the "
+                "gateway and never reached the target."
+            )
+        elif mode == "passthrough":
+            st.info(
+                "Passthrough (observability) — every prompt reached the target; "
+                "gateway verdicts were recorded but not enforced."
+            )
+
     if "expected_decision" in filtered.columns and "gateway_decision" in filtered.columns:
         sub = filtered.dropna(subset=["expected_decision", "gateway_decision"]).copy()
         sub["expected_decision"] = sub["expected_decision"].astype(str).str.lower()

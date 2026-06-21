@@ -126,6 +126,10 @@ class AnalyzeResponse(BaseModel):
     evidence: List[str] = Field(default_factory=list)
     module_risks: List[ModuleRisk] = Field(default_factory=list)
     latency_ms: Optional[int] = Field(default=None, ge=0)
+    # Sprint 11: set only on a `sanitize` decision — the prompt with malicious
+    # segments stripped by prompt_guard's sanitize stage. Consumers (firewall
+    # forward_strip) forward this instead of the raw prompt. None otherwise.
+    sanitized_prompt: Optional[str] = Field(default=None)
 
     # Backward-compat aliases
     @property

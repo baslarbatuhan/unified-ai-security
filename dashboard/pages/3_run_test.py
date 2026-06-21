@@ -407,12 +407,31 @@ with st.form("run_test_form"):
             height=140,
         )
         max_attacks = 0  # unused in single mode
+        firewall_mode = False  # suite-only control; defined here to avoid NameError
     else:
         st.markdown("**Suite settings**")
         max_attacks = st.number_input(
             "Max attacks (0 = all)", min_value=0, max_value=500, value=10, step=1,
             key="suite_max_attacks",
             help="Number of attack cases to run from the suite. 0 = entire suite.",
+        )
+        # Sprint 11 — firewall enforcement toggle. OFF = observability
+        # (passthrough): every prompt reaches the target, gateway only scores.
+        # ON = block verdicts stop the prompt before the adapter is called.
+        # Override-only: it cannot downgrade a target whose YAML already sets
+        # policy.mode=firewall.
+        firewall_mode = st.toggle(
+            "🛡️ Firewall mode (block ⇒ prompt never reaches target)",
+            value=False,
+            key="suite_firewall",
+            help=(
+                "OFF (passthrough): observability — the prompt is always "
+                "forwarded and the gateway verdict is only recorded. "
+                "ON (firewall): a `block` verdict stops the prompt at the "
+                "gateway; the target is never called (forwarded_to_target=0, "
+                "adapter_state=blocked_by_gateway_pre). Demo both by running "
+                "the same suite twice."
+            ),
         )
         user_prompt = ""
         model_output = ""
@@ -513,6 +532,7 @@ if _is_suite:
                 "max_attacks": int(max_attacks),
                 "run_id": run_id,
                 "target_has_tools": target_has_tools,
+                "firewall": bool(firewall_mode),
                 "config_snapshot_path": str(snapshot_path),
             },
         )

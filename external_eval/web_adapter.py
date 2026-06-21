@@ -227,6 +227,11 @@ class WebAdapter(ChatbotAdapter):
         selectors = self.target.selectors
         assert selectors is not None
 
+        # All prompts in a run share ONE chat (one page, never re-navigated),
+        # so a run shows up as a single conversation — same UX as the API
+        # target's per-run chat. Multi-turn in one chat is made reliable by
+        # the Enter-key submit fallback below.
+
         # Locate input. SPAs (Open WebUI / Svelte, React chatbots) build
         # the input node in JS *after* `domcontentloaded`, so a bare
         # `count()` snapshot races the render and fails with
@@ -241,12 +246,25 @@ class WebAdapter(ChatbotAdapter):
         except Exception as exc:
             raise AdapterError(f"input fill failed on {input_sel!r}: {exc}") from exc
 
-        # Submit
+        # Submit. Prefer the configured button, but fall back to pressing
+        # Enter when the click isn't actionable. After the first turn many
+        # SPA chats (Open WebUI included) float a scroll-to-bottom / overlay
+        # element over the send button: Playwright sees it visible + enabled
+        # but the click never lands ("element does not receive pointer
+        # events" → 60s hang). Enter submits reliably in that state, so we
+        # try the button with a short budget and degrade to Enter. This keeps
+        # the whole run in one chat instead of needing a fresh page per turn.
         if selectors.submit:
             try:
-                self._page.locator(selectors.submit).first.click()
-            except Exception as exc:
-                raise AdapterError(f"submit click failed on {selectors.submit!r}: {exc}") from exc
+                self._page.locator(selectors.submit).first.click(timeout=5000)
+            except Exception:
+                try:
+                    input_el.press("Enter")
+                except Exception as exc:
+                    raise AdapterError(
+                        f"submit failed: button {selectors.submit!r} not "
+                        f"clickable and Enter fallback failed: {exc}"
+                    ) from exc
         else:
             try:
                 input_el.press("Enter")

@@ -210,7 +210,8 @@ def test_response_to_dict_shape(monkeypatch):
     resp = _engine_serial().analyze(user_input="x")
     d = resp.to_dict()
     assert set(d.keys()) == {
-        "final_decision", "decision_band", "fused_risk", "module_risks", "latency_ms"
+        "final_decision", "decision_band", "fused_risk", "module_risks",
+        "latency_ms", "sanitized_prompt",
     }
     assert len(d["module_risks"]) == 3
     names = {m["module"] for m in d["module_risks"]}

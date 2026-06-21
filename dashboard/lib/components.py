@@ -68,7 +68,10 @@ def format_registry_label(entry: Dict[str, Any]) -> str:
     suite = entry.get("suite") or "?"
     n = entry.get("n_rows") or entry.get("n_cases") or 0
     when = (entry.get("ended_at") or entry.get("started_at") or "")[:19].replace("T", " ")
-    return f"{when} · {tgt} · {suite} · n={n} · {rid}"
+    # Sprint 11: tag firewall runs so they're distinguishable at a glance in
+    # every run picker. Passthrough (the default/legacy) stays unmarked.
+    badge = " · 🛡️firewall" if (entry.get("mode") == "firewall") else ""
+    return f"{when} · {tgt} · {suite} · n={n} · {rid}{badge}"
 
 
 def run_selector_widget(

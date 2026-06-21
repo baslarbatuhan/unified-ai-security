@@ -73,7 +73,13 @@ class PipelineResult:
     def to_module_risk_dict(self) -> Dict[str, Any]:
         """Export risk in ModuleRisk-compatible format."""
         if self.risk:
-            return self.risk.to_module_risk_dict()
+            d = self.risk.to_module_risk_dict()
+            # Surface the sanitized prompt produced by the sanitize stage so
+            # the engine/gateway can expose it on a `sanitize` verdict (the
+            # firewall `forward_strip` action forwards this mutated prompt).
+            if self.sanitization is not None:
+                d["sanitized_prompt"] = self.sanitization.sanitized_prompt
+            return d
         return {
             "module": "prompt_guard",
             "risk_score": 0.0,

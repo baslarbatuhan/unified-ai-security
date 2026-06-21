@@ -200,13 +200,11 @@ TARGET_PRESETS: Dict[str, Dict[str, Any]] = {
     # Mint the key in Open WebUI → Settings → Account → API Keys, then
     # paste it into the 🔐 vault field on the Targets form.
     #
-    # request_template note: Open WebUI's /api/chat/completions is NOT a
-    # pure OpenAI clone — it also wants `chat_id` and `stream`. Omitting
-    # `chat_id` makes the server do `chat_id.startswith(...)` on None and
-    # return a 400 ("'NoneType' object has no attribute 'startswith'").
-    # `stream: false` keeps the response a single JSON object so
-    # `response_path` can extract it. `model` must match a name from
-    # `ollama list` — adjust if your local model differs.
+    # request_template note: Open WebUI's /api/chat/completions wants `stream`
+    # (false → single JSON object so `response_path` can extract it). `chat_id`
+    # is injected automatically by APIAdapter as a real chat UUID when
+    # metadata.openwebui=true, which also mirrors each prompt+reply into a
+    # sidebar-visible chat. `model` must match a name from `ollama list`.
     "Open WebUI (api)": {
         "type": "api",
         "endpoint": "http://open-webui:8080/api/chat/completions",
@@ -215,11 +213,11 @@ TARGET_PRESETS: Dict[str, Dict[str, Any]] = {
         "request_template": {
             "model": "qwen2.5:3b",
             "messages": [{"role": "user", "content": "{prompt}"}],
-            "chat_id": "uais-eval-probe",
             "stream": False,
         },
         "response_path": "choices.0.message.content",
         "timeout_seconds": 60.0,
+        "metadata": {"openwebui": True},
     },
 }
 

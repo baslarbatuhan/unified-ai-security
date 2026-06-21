@@ -148,6 +148,7 @@ def append_registry_entry(
     n_cases: int,
     n_rows: int,
     relative_path: str,
+    mode: Optional[str] = None,
 ) -> Path:
     """Append a one-line summary to runs/_registry.jsonl.
 
@@ -168,6 +169,9 @@ def append_registry_entry(
         "n_cases": int(n_cases or 0),
         "n_rows": int(n_rows or 0),
         "path": relative_path,
+        # Sprint 11: firewall vs passthrough, so the run list can tag the mode
+        # without opening the manifest. Optional — older entries omit it.
+        "mode": mode,
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "registered_at": _utc_now_iso(),
     }

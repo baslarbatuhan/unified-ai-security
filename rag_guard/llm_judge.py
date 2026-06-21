@@ -88,6 +88,11 @@ DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL = os.getenv("LLM_JUDGE_MODEL", "qwen2.5:7b")
 FALLBACK_MODEL = "llama3.1:8b"
 FALLBACK_MODEL_2 = "gemma2:2b"
+# Keep the judge model resident in Ollama's VRAM between calls/runs so the
+# first case of a run (and every run within the window) doesn't pay a model
+# reload. "-1" = keep forever; "30m" = keep 30 min after last use. Override
+# via OLLAMA_KEEP_ALIVE. Ollama accepts a duration string or seconds.
+DEFAULT_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 JUDGE_SYSTEM_PROMPT = """You are a strict security judge. Analyze this text and return a precise decimal risk score between 0.00 and 1.00, along with a single-sentence reason. Provide your response strictly in JSON format with the keys 'risk_score' and 'reason'.
 
@@ -202,6 +207,7 @@ class LLMJudge:
         model: str = DEFAULT_MODEL,
         fallback_model: str = FALLBACK_MODEL,
         fallback_model_2: str = FALLBACK_MODEL_2,
+        keep_alive: str = DEFAULT_KEEP_ALIVE,
         timeout: Optional[int] = None,
         temperature: float = 0.0,
         seed: int = 42,
@@ -214,6 +220,7 @@ class LLMJudge:
         self.model = model
         self.fallback_model = fallback_model
         self.fallback_model_2 = fallback_model_2
+        self.keep_alive = keep_alive
         # Hafta 11: per-call timeout from config (llm_judge_ms). Explicit
         # `timeout=` arg wins for tests + legacy callers; otherwise pull
         # from the active profile. Hardcoded 30s only as last-resort
@@ -297,6 +304,8 @@ class LLMJudge:
                 {"role": "user", "content": user_prompt},
             ],
             "stream": False,
+            # Keep the model loaded so the next case/run skips the reload.
+            "keep_alive": self.keep_alive,
             "options": {
                 "temperature": self.temperature,
                 "seed": self.seed,

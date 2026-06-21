@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -45,6 +46,7 @@ from external_eval.secret_resolver import (
     resolve as _resolve_secret,
     interpolate as _interpolate_secrets,
 )
+from external_eval import openwebui_chat as _owui
 
 
 DEFAULT_REQUEST_TEMPLATE: Dict[str, Any] = {
@@ -64,6 +66,12 @@ class APIAdapter(ChatbotAdapter):
                 f"APIAdapter target {target.id!r} missing endpoint"
             )
         self._client: Optional[httpx.Client] = None
+        # Open WebUI sidebar integration (lazy): when the target is an Open
+        # WebUI chat endpoint we mirror each forwarded prompt + reply into a
+        # real, sidebar-visible chat. The session holds the accumulated
+        # transcript; the chat is created on the first successful send.
+        self._is_owui: bool = _owui.is_openwebui_target(target)
+        self._owui_session: Optional[_owui.OpenWebUISession] = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -178,6 +186,56 @@ class APIAdapter(ChatbotAdapter):
 
         return _walk(tpl)
 
+    # ------------------------------------------------------------------
+    # Open WebUI sidebar integration
+    # ------------------------------------------------------------------
+    def _owui_headers(self) -> Dict[str, str]:
+        """Auth headers for the Open WebUI ``/api/v1/chats`` API (JSON)."""
+        headers = dict(self._auth_headers())
+        headers["Content-Type"] = "application/json"
+        return headers
+
+    def _ensure_owui_chat(
+        self, headers: Dict[str, str], session_context: Dict[str, Any]
+    ) -> Optional[str]:
+        """Create the per-run sidebar chat on first use; return its UUID.
+
+        Best-effort: if the chat API is unreachable we log and return None so
+        the completion still goes out (just without sidebar mirroring).
+        """
+        if self._owui_session is not None and self._owui_session.chat_id:
+            return self._owui_session.chat_id
+
+        tpl = self.target.request_template or DEFAULT_REQUEST_TEMPLATE
+        model = str(tpl.get("model") or "qwen2.5:3b")
+        run_id = str(session_context.get("run_id") or "").strip()
+        title = str(
+            session_context.get("openwebui_chat_title")
+            or (f"UAIS Eval {run_id}" if run_id else "UAIS Eval")
+        )
+        if self._owui_session is None:
+            self._owui_session = _owui.OpenWebUISession(model=model, title=title)
+
+        try:
+            chat_id = _owui.create_chat(
+                self._get_client(),
+                base=_owui.base_url(self.target.endpoint or ""),
+                headers=self._owui_headers(),
+                title=title,
+                model=model,
+            )
+            self._owui_session.chat_id = chat_id
+            print(
+                f"[openwebui] created sidebar chat id={chat_id} title={title!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return chat_id
+        except Exception as exc:  # noqa: BLE001 — sidebar is optional
+            print(f"[openwebui] chat create failed (continuing): {exc}",
+                  file=sys.stderr, flush=True)
+            return None
+
     def _render_query(self, prompt: str, session_context: Dict[str, Any]) -> Dict[str, str]:
         """Render `query_template` for GET-style targets.
 
@@ -274,6 +332,14 @@ class APIAdapter(ChatbotAdapter):
             else:  # POST default — backward compatible
                 headers["Content-Type"] = "application/json"
                 body = self._render_template(prompt, session_context)
+                # Open WebUI: ensure a sidebar-visible chat exists and point
+                # the completion at its real UUID. Single-turn `messages` is
+                # left untouched so eval semantics are unchanged.
+                if self._is_owui:
+                    chat_id = self._ensure_owui_chat(headers, session_context)
+                    if chat_id:
+                        body["chat_id"] = chat_id
+                    body.setdefault("stream", False)
                 # Hafta 11.2: even POST endpoints may use query auth
                 # (e.g. Gemini's generateContent uses ?key=… alongside a
                 # JSON body). For auth types other than `query` this is
@@ -319,6 +385,21 @@ class APIAdapter(ChatbotAdapter):
                 )
             text = resp.text
 
+        # Open WebUI: mirror this completed exchange into the sidebar chat.
+        # Best-effort — a chat-API hiccup must never fail the eval send (the
+        # completion already succeeded, so the gateway verdict is valid).
+        if self._is_owui and method != "GET" and self._owui_session and self._owui_session.chat_id:
+            try:
+                _owui.append_turn(self._owui_session, prompt, text)
+                _owui.persist(
+                    self._get_client(),
+                    base=_owui.base_url(self.target.endpoint or ""),
+                    headers=self._owui_headers(),
+                    session=self._owui_session,
+                )
+            except Exception as exc:  # noqa: BLE001 — sidebar mirror is optional
+                print(f"[openwebui] sidebar mirror failed: {exc}", file=sys.stderr, flush=True)
+
         metadata = {
             "status_code": resp.status_code,
             "http_method": method,
@@ -326,6 +407,8 @@ class APIAdapter(ChatbotAdapter):
             "response_bytes": len(resp.content),
             "content_type": ctype,
         }
+        if self._is_owui and self._owui_session and self._owui_session.chat_id:
+            metadata["openwebui_chat_id"] = self._owui_session.chat_id
         return text, metadata
 
 

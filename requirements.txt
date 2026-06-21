@@ -1,17 +1,19 @@
 # unified-ai-security
-# Python 3.10+
+# Python 3.10+ (local venv); Docker image uses Python 3.11
 #
-# Install:
+# Local install:
 #   python3 -m venv .venv && source .venv/bin/activate
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   pip install -r requirements.txt
+#   playwright install chromium    # only for external_eval web targets
 #
+# Docker: dependencies installed in Dockerfile; Chromium via `playwright install --with-deps`
 
 # Core ML
 sentence-transformers>=2.2.0
 numpy>=1.24,<3
 
-# RAG vector store
+# RAG vector store (Chroma client; compose also runs chromadb/chroma server)
 chromadb>=0.4.22,<2
 
 # Schemas & validation
@@ -27,37 +29,25 @@ uvicorn[standard]>=0.22
 requests>=2.28
 httpx>=0.24
 
-# Tool execution (Hafta 14):
-# simpleeval is an AST-restricted expression evaluator — never eval()/exec().
-# `tools/calculator.py` falls back to a hand-rolled walker if absent, but
-# we ship simpleeval explicitly so demo runs use the maintained library.
+# Local tool execution (tools_local adapter + Hafta 14 demos)
 simpleeval>=0.9
 
-# Web target adapter (Sprint 8):
-# Playwright drives a headless Chromium for `type=web` targets
-# (external_eval/web_adapter.py). The browser binary itself is installed
-# in the Dockerfile via `playwright install --with-deps chromium`; this
-# line only pulls the Python bindings. WebAdapter import-guards on this
-# so the package still loads on hosts without Playwright.
+# Web target adapter (Sprint 8): Playwright + Chromium for type=web targets.
+# Browser binary: Dockerfile runs `playwright install --with-deps chromium`.
 playwright>=1.40
 
-# Evaluation report generation (Hafta 15):
-# matplotlib used by scripts/generate_thesis_report.py to render the
-# charts that ship as PNG attachments next to the markdown / PDF report.
-# Headless Agg backend so it works in Docker without an X server.
+# Evaluation / thesis report charts
 matplotlib>=3.5
 
-# Sandbox execution (Docker SDK)
+# Optional sandbox profile (docker-compose sandbox service)
 docker>=7.0
 
-# Dashboard UI (Streamlit, separate process from the gateway)
+# Dashboard (Streamlit — separate process from gateway)
 streamlit>=1.30
 streamlit-autorefresh>=1.0
 pandas>=2.0
 plotly>=5.18
-# PDF export from the Reports page. reportlab is the lightweight fallback;
-# weasyprint+markdown gives prettier output if installed.
 reportlab>=4.0
 
-# Testing
+# Test suite (~609 tests)
 pytest>=7.4

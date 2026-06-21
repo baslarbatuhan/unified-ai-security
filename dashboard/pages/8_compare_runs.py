@@ -107,13 +107,30 @@ right_df = _load(right_id)
 # ---------------------------------------------------------------------------
 # Header — what each side is
 # ---------------------------------------------------------------------------
+def _mode_of(d: pd.DataFrame) -> str:
+    """Effective firewall mode for a run, derived from its result rows."""
+    if "mode" in d.columns and not d.empty:
+        vals = d["mode"].astype(str)
+        uniq = [v for v in vals.unique() if v]
+        if len(uniq) == 1:
+            return uniq[0]
+        if len(uniq) > 1:
+            return "mixed"
+    return "—"
+
+
 def _header_box(col, side_label: str, entry: dict, df: pd.DataFrame) -> None:
     col.markdown(f"### {side_label}")
     col.caption(entry.get("run_id") or "?")
-    cc = col.columns(3)
+    cc = col.columns(4)
     cc[0].metric("Target", entry.get("target_id") or "?")
     cc[1].metric("Suite", entry.get("suite") or "?")
     cc[2].metric("Rows", len(df))
+    # Mode from results (authoritative) → fall back to the registry entry.
+    mode = _mode_of(df)
+    if mode == "—":
+        mode = entry.get("mode") or "—"
+    cc[3].metric("Mode", mode)
 
 
 hl, hr = st.columns(2)
@@ -157,6 +174,60 @@ for i, key in enumerate(("total", "block", "sanitize", "allow", "miss", "avg_lat
 
 
 # ---------------------------------------------------------------------------
+# Firewall enforcement (Sprint 11) — the passthrough-vs-firewall story.
+# This is the centrepiece of the firewall demo: two runs with the SAME
+# gateway decisions can differ entirely in whether the prompt reached the
+# target. `gateway_decision` stays equal; `forwarded_to_target` does not.
+# ---------------------------------------------------------------------------
+def _fw_stats(d: pd.DataFrame) -> dict:
+    out = {"mode": _mode_of(d), "forwarded": 0, "stopped": 0, "blocked_pre": 0}
+    if "forwarded_to_target" in d.columns and not d.empty:
+        fwd = pd.to_numeric(d["forwarded_to_target"], errors="coerce").fillna(0)
+        out["forwarded"] = int((fwd == 1).sum())
+        out["stopped"] = int((fwd == 0).sum())
+    if "adapter_state" in d.columns and not d.empty:
+        out["blocked_pre"] = int(
+            (d["adapter_state"].astype(str) == "blocked_by_gateway_pre").sum()
+        )
+    return out
+
+
+st.subheader("🛡️ Firewall enforcement")
+_has_fw = (
+    "forwarded_to_target" in left_df.columns
+    or "forwarded_to_target" in right_df.columns
+)
+if not _has_fw:
+    st.info(
+        "Neither run carries firewall columns (pre-Sprint-11 runs). Re-run "
+        "with the firewall toggle on the **Run test** page to populate this."
+    )
+else:
+    lf, rf = _fw_stats(left_df), _fw_stats(right_df)
+    fw_cols = st.columns(2)
+    fw_cols[0].markdown(f"**Left** · mode `{lf['mode']}`")
+    fw_cols[0].metric("Forwarded → target", lf["forwarded"])
+    fw_cols[0].metric(
+        "Stopped before target", lf["stopped"],
+        f"{lf['blocked_pre']} blocked_by_gateway_pre" if lf["blocked_pre"] else None,
+    )
+    fw_cols[1].markdown(f"**Right** · mode `{rf['mode']}`")
+    fw_cols[1].metric(
+        "Forwarded → target", rf["forwarded"],
+        f"{rf['forwarded'] - lf['forwarded']:+d} vs left",
+        delta_color="off",
+    )
+    fw_cols[1].metric(
+        "Stopped before target", rf["stopped"],
+        f"{rf['blocked_pre']} blocked_by_gateway_pre" if rf["blocked_pre"] else None,
+    )
+    st.caption(
+        "Same gateway verdicts, different enforcement: a firewall run stops "
+        "blocked prompts here — they never reach the target."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Distribution comparisons
 # ---------------------------------------------------------------------------
 def _dist_compare(left: pd.DataFrame, right: pd.DataFrame, col: str) -> Optional[pd.DataFrame]:
@@ -186,6 +257,21 @@ if band_df is not None and not band_df.empty:
     st.bar_chart(band_df)
 else:
     st.info("Older runs may lack `gateway_decision_band`.")
+
+if _has_fw:
+    st.subheader("firewall_action")
+    act_df = _dist_compare(left_df, right_df, "firewall_action")
+    if act_df is not None and not act_df.empty:
+        st.bar_chart(act_df)
+    else:
+        st.info("No firewall_action data.")
+
+    st.subheader("adapter_state")
+    state_df = _dist_compare(left_df, right_df, "adapter_state")
+    if state_df is not None and not state_df.empty:
+        st.bar_chart(state_df)
+    else:
+        st.info("No adapter_state data.")
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +341,8 @@ if (
     and not left_df.empty and not right_df.empty
 ):
     keep_cols = [c for c in ("case_id", "gateway_decision", "gateway_decision_band",
-                              "gateway_fused_score", "gateway_miss")
+                              "gateway_fused_score", "gateway_miss",
+                              "forwarded_to_target", "adapter_state", "firewall_action")
                  if c in left_df.columns and c in right_df.columns]
     if "case_id" not in keep_cols:
         st.info("Need `case_id` on both sides for a meaningful diff.")
@@ -266,27 +353,53 @@ if (
         if merged.empty:
             st.info("No overlapping case_ids — different suites or no shared probes.")
         else:
-            # Highlight rows where decision changed.
+            # Two independent axes of change:
+            #   * decision_changed   — the gateway verdict differs
+            #   * enforcement_changed — the prompt reached the target in one
+            #                           run but not the other (the firewall
+            #                           story: same verdict, different action)
+            # Passthrough-vs-firewall diffs show NO decision change but DO show
+            # enforcement change, so the default filter must include both — or
+            # the demo's headline table would look empty.
+            n_overlap = len(merged)
+            merged["decision_changed"] = False
+            merged["enforcement_changed"] = False
+
             if "gateway_decision_L" in merged and "gateway_decision_R" in merged:
                 merged["decision_changed"] = (
                     merged["gateway_decision_L"].astype(str)
                     != merged["gateway_decision_R"].astype(str)
                 )
-                if "gateway_fused_score_L" in merged and "gateway_fused_score_R" in merged:
-                    merged["fused_delta"] = (
-                        pd.to_numeric(merged["gateway_fused_score_R"], errors="coerce")
-                        - pd.to_numeric(merged["gateway_fused_score_L"], errors="coerce")
-                    ).round(4)
-                changed = merged[merged["decision_changed"]]
-                st.metric(
-                    "Cases with decision change",
-                    f"{len(changed)} / {len(merged)} overlapping",
+            if "gateway_fused_score_L" in merged and "gateway_fused_score_R" in merged:
+                merged["fused_delta"] = (
+                    pd.to_numeric(merged["gateway_fused_score_R"], errors="coerce")
+                    - pd.to_numeric(merged["gateway_fused_score_L"], errors="coerce")
+                ).round(4)
+            if "forwarded_to_target_L" in merged and "forwarded_to_target_R" in merged:
+                merged["enforcement_changed"] = (
+                    pd.to_numeric(merged["forwarded_to_target_L"], errors="coerce").fillna(-1)
+                    != pd.to_numeric(merged["forwarded_to_target_R"], errors="coerce").fillna(-1)
                 )
-                show_only_changed = st.checkbox(
-                    "Show only changed cases", value=True,
-                    help="Uncheck to see all overlapping cases.",
-                )
-                view = changed if show_only_changed else merged
-                st.dataframe(view, width="stretch", hide_index=True)
+
+            merged["row_changed"] = merged["decision_changed"] | merged["enforcement_changed"]
+            changed = merged[merged["row_changed"]]
+
+            mc1, mc2 = st.columns(2)
+            mc1.metric(
+                "Cases with decision change",
+                f"{int(merged['decision_changed'].sum())} / {n_overlap}",
+            )
+            mc2.metric(
+                "Cases with enforcement change",
+                f"{int(merged['enforcement_changed'].sum())} / {n_overlap}",
+                help="forwarded_to_target differs — e.g. passthrough forwarded, "
+                     "firewall stopped. This is the passthrough-vs-firewall signal.",
+            )
+            show_only_changed = st.checkbox(
+                "Show only changed cases (decision OR enforcement)", value=True,
+                help="Uncheck to see all overlapping cases.",
+            )
+            view = changed if show_only_changed else merged
+            st.dataframe(view, width="stretch", hide_index=True)
 else:
     st.info("Per-case diff needs `case_id` on both sides.")
